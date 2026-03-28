@@ -14,25 +14,30 @@ from flask import Flask, Response, render_template_string, jsonify
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-DOCKER_CONTAINER = "ebusd"                 # change to your container name/id
-POLL_INTERVAL    = 10                      # seconds between ebusctl polls
+DOCKER_CONTAINER = "ebusd"   # change to your container name/id
+POLL_INTERVAL    = 5                       # seconds between ebusctl polls
 HISTORY_POINTS   = 120                     # data points kept per metric
 
 # Fields to poll via: ebusctl read -f <field>
 # Format: { "key": ("ebusctl_field_name", "display_label", "unit") }
 EBUSCTL_FIELDS = {
-    "flow":          ("BuildingCircuitFlow",   "Circuit Flow",        "l/h"),
-    "flow_temp":     ("FlowTemp",       "Flow Temp",           "°C"),
-    "target_flow_temp":     ("TargetFlowTemp",       "Target flow Temp",           "°C"),
-    "return_temp":   ("RunDataReturnTemp",     "Return Temp",         "°C"),
-    "outside_temp":  ("OutdoorTemp",    "Outside Temp",        "°C"),
-    "air_intake_temp":  ("AirIntakeTemp",    "Temp on back of pump",        "°C"),
-    "dhw_temp":      ("HwcTemp",  "DHW Temp",            "°C"),
-    "power":         ("CurrentConsumedPower",         "Power consumption",            "kW"),
-    "power_yield":         ("CurrentYieldPower",         "Power yield",            "kW"),
-    "cop":           ("COP",                   "COP",                 ""),
-    "compressor":    ("RunDataCompressorSpeed",       "Compressor Speed",    "rpm"),
-    "integral":      ("EnergyIntegral",     "Energie-integral",   "ºmin")
+    "flow":             ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
+    "flow_temp":        ("FlowTemp",                 "Flow Temp",            "°C"),
+    "target_flow_temp": ("TargetFlowTemp",           "Target Flow Temp",     "°C"),
+    "return_temp":      ("RunDataReturnTemp",         "Return Temp",          "°C"),
+    "outside_temp":     ("OutdoorTemp",              "Outside Temp",         "°C"),
+    "air_intake_temp":  ("AirIntakeTemp",            "Temp on back of pump", "°C"),
+    "dhw_temp":         ("HwcTemp",                  "DHW Temp",             "°C"),
+    "power":            ("CurrentConsumedPower",     "Power consumption",    "kW"),
+    "power_yield":      ("CurrentYieldPower",        "Power yield",          "kW"),
+    "cop":              ("COP",                      "COP",                  ""),
+    "compressor":       ("RunDataCompressorSpeed",   "Compressor Speed",     "rpm"),
+    "integral":         ("EnergyIntegral",           "Energie-integral",     "ºmin"),
+}
+
+# Extra fields polled for mode indicators but NOT shown as charts
+EXTRA_FIELDS = {
+    "three_way_valve": "ThreeWayValve",
 }
 
 # ── Shared state ─────────────────────────────────────────────────────────────
@@ -66,6 +71,17 @@ def parse_value(raw: str) -> float | None:
     return float(m.group()) if m else None
 
 
+def derive_mode(latest_snap: dict) -> str:
+    """Return 'dhw' | 'heating' | 'idle' based on latest values."""
+    compressor = latest_snap.get("compressor", {}).get("value", 0) or 0
+    valve      = latest_snap.get("three_way_valve", {}).get("value", 0) or 0
+    if compressor > 0 and valve == 1:
+        return "dhw"
+    if compressor > 0:
+        return "heating"
+    return "idle"
+
+
 def poll_loop():
     """Background thread: poll all configured fields every POLL_INTERVAL seconds."""
     while True:
@@ -87,8 +103,22 @@ def poll_loop():
                                 "raw": raw, "ts": ts}
             updates[key] = point
 
+        # Poll extra (non-chart) fields
+        for key, field in EXTRA_FIELDS.items():
+            raw = run_ebusctl(field)
+            if raw is None:
+                continue
+            value = parse_value(raw)
+            if value is None:
+                continue
+            with data_lock:
+                latest[key] = {"value": value, "raw": raw, "ts": ts}
+
         if updates:
-            _broadcast(json.dumps({"type": "update", "ts": ts, "data": updates}))
+            with data_lock:
+                mode = derive_mode(latest)
+            _broadcast(json.dumps({"type": "update", "ts": ts,
+                                   "data": updates, "mode": mode}))
 
         time.sleep(POLL_INTERVAL)
 
@@ -138,7 +168,8 @@ def api_history():
     with data_lock:
         out = {k: list(v) for k, v in series.items()}
         out["latest"] = dict(latest)
-        out["logs"] = list(log_lines)
+        out["logs"]   = list(log_lines)
+        out["mode"]   = derive_mode(latest)
     return jsonify(out)
 
 
@@ -235,6 +266,45 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   .status-label { font-family: var(--mono); font-size: .75rem; color: var(--muted); }
 
+  /* Mode indicators */
+  .mode-badges { display: flex; gap: .6rem; margin-left: auto; align-items: center; }
+  .badge {
+    display: flex; align-items: center; gap: .45rem;
+    padding: .35rem .75rem;
+    border-radius: 2px;
+    border: 1px solid var(--border);
+    font-family: var(--mono); font-size: .7rem; letter-spacing: .08em;
+    text-transform: uppercase;
+    background: #0a1520;
+    color: var(--muted);
+    transition: border-color .4s, color .4s, box-shadow .4s;
+  }
+  .badge-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+    transition: background .4s, box-shadow .4s;
+  }
+  .badge.active-heating {
+    border-color: #ff6b35;
+    color: #ff9a6c;
+    box-shadow: 0 0 10px #ff6b3540;
+  }
+  .badge.active-heating .badge-dot {
+    background: #ff6b35;
+    box-shadow: 0 0 6px #ff6b35;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .badge.active-dhw {
+    border-color: #00d4ff;
+    color: #6ee6ff;
+    box-shadow: 0 0 10px #00d4ff40;
+  }
+  .badge.active-dhw .badge-dot {
+    background: #00d4ff;
+    box-shadow: 0 0 6px #00d4ff;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
   /* KPI strip */
   .kpi-strip {
     display: grid;
@@ -317,6 +387,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div>
     <div class="logo">e<span>BUS</span> Monitor</div>
     <div class="subtitle">Heat Pump Live Dashboard</div>
+  </div>
+  <div class="mode-badges">
+    <div class="badge" id="badge-heating">
+      <div class="badge-dot"></div>
+      <span>Heating</span>
+    </div>
+    <div class="badge" id="badge-dhw">
+      <div class="badge-dot"></div>
+      <span>Hot Water</span>
+    </div>
   </div>
   <div class="status-label" id="status-label">connecting…</div>
   <div class="status-dot offline" id="status-dot"></div>
@@ -413,6 +493,14 @@ function buildUI() {
   }
 }
 
+// ── Mode indicators ───────────────────────────────────────────────────────────
+function updateMode(mode) {
+  const bH = document.getElementById('badge-heating');
+  const bD = document.getElementById('badge-dhw');
+  bH.className = 'badge' + (mode === 'heating' ? ' active-heating' : '');
+  bD.className = 'badge' + (mode === 'dhw'     ? ' active-dhw'     : '');
+}
+
 // ── Push a data point into chart + KPI ──────────────────────────────────────
 function pushPoint(key, ts, value) {
   if (!(key in chartMap)) return;
@@ -485,6 +573,7 @@ function connect() {
       for (const [key, point] of Object.entries(msg.data)) {
         if (point) pushPoint(key, point.ts, point.value);
       }
+      if (msg.mode) updateMode(msg.mode);
     }
     if (msg.type === 'log') {
       appendLog(msg.line);
@@ -504,6 +593,7 @@ async function loadHistory() {
     }
 
     (h.logs || []).forEach(appendLog);
+    if (h.mode) updateMode(h.mode);
 
     if (h.latest) {
       for (const [key, meta] of Object.entries(h.latest)) {
