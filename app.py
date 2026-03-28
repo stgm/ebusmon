@@ -7,16 +7,20 @@ import threading
 import time
 import json
 import re
-from datetime import datetime
-from collections import deque
+import os
+import atexit
+from datetime import datetime, date
+from collections import deque, defaultdict
+from pathlib import Path
 from flask import Flask, Response, render_template_string, jsonify
 
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-DOCKER_CONTAINER = "ebusd"   # change to your container name/id
+DOCKER_CONTAINER = "ebusd"                 # change to your container name/id
 POLL_INTERVAL    = 5                       # seconds between ebusctl polls
-HISTORY_POINTS   = 120                     # data points kept per metric
+HISTORY_POINTS   = 1440                    # one per minute × 24 h = full day in memory
+DATA_DIR         = Path("data")            # where daily .jsonl files are stored
 
 # Fields to poll via: ebusctl read -f <field>
 # Format: { "key": ("ebusctl_field_name", "display_label", "unit") }
@@ -28,11 +32,11 @@ EBUSCTL_FIELDS = {
     "outside_temp":     ("OutdoorTemp",              "Outside Temp",         "°C"),
     "air_intake_temp":  ("AirIntakeTemp",            "Temp on back of pump", "°C"),
     "dhw_temp":         ("HwcTemp",                  "DHW Temp",             "°C"),
-    "power":            ("CurrentConsumedPower",     "Power consumption",    "kW"),
+    "power_consumption": ("CurrentConsumedPower",    "Power consumption",    "kW"),
     "power_yield":      ("CurrentYieldPower",        "Power yield",          "kW"),
     "cop":              ("COP",                      "COP",                  ""),
-    "compressor":       ("RunDataCompressorSpeed",   "Compressor Speed",     "rpm"),
-    "integral":         ("EnergyIntegral",           "Energie-integral",     "ºmin"),
+    "compressor_speed": ("RunDataCompressorSpeed",   "Compressor Speed",     "rpm"),
+    "energy_integral":  ("EnergyIntegral",           "Energie-integral",     "ºmin"),
 }
 
 # Extra fields polled for mode indicators but NOT shown as charts
@@ -41,11 +45,15 @@ EXTRA_FIELDS = {
 }
 
 # ── Shared state ─────────────────────────────────────────────────────────────
-data_lock   = threading.Lock()
+data_lock    = threading.Lock()
 series: dict[str, deque] = {k: deque(maxlen=HISTORY_POINTS) for k in EBUSCTL_FIELDS}
 latest: dict[str, dict]  = {}          # { key: {value, unit, label, ts} }
 log_lines: deque          = deque(maxlen=200)
 sse_clients: list         = []
+
+# Accumulator for per-minute averaging before writing to disk
+_minute_bucket: dict[str, list] = defaultdict(list)   # key → [values in current minute]
+_current_minute: str             = ""                  # "YYYY-MM-DDTHH:MM"
 
 
 # ── ebusctl helpers ──────────────────────────────────────────────────────────
@@ -71,9 +79,88 @@ def parse_value(raw: str) -> float | None:
     return float(m.group()) if m else None
 
 
+# ── Persistence ───────────────────────────────────────────────────────────────
+def _day_file(d: date) -> Path:
+    DATA_DIR.mkdir(exist_ok=True)
+    return DATA_DIR / f"{d.isoformat()}.jsonl"
+
+
+def _append_record(record: dict):
+    """Append a single averaged minute record to today's JSONL file."""
+    path = _day_file(date.today())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def load_today() -> list[dict]:
+    """
+    Load all records from today's file.
+    Returns a list of {ts, <key>: value, ...} dicts.
+    Silently skips malformed lines.
+    """
+    path = _day_file(date.today())
+    records = []
+    if not path.exists():
+        return records
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def _flush_minute_bucket(minute_str: str):
+    """
+    Average the accumulated values for `minute_str`, write to disk,
+    and push each key into the in-memory series deque.
+    Called with data_lock HELD.
+    """
+    if not _minute_bucket:
+        return
+    ts = minute_str + ":30"   # represent the minute at its midpoint
+    record: dict = {"ts": ts}
+    for key, values in _minute_bucket.items():
+        if values:
+            record[key] = round(sum(values) / len(values), 3)
+    _minute_bucket.clear()
+
+    # Persist
+    try:
+        _append_record(record)
+    except Exception as e:
+        print(f"[persist] write error: {e}")
+
+    # Also push into live series so restored data appears in charts
+    for key in EBUSCTL_FIELDS:
+        if key in record:
+            series[key].append({"ts": ts, "value": record[key]})
+
+
+def restore_today():
+    """
+    On startup: read today's JSONL, populate the in-memory series deques.
+    Unknown keys in the file are ignored (handles removed fields).
+    Keys present in EBUSCTL_FIELDS but absent from a record are skipped
+    (handles newly-added fields with no historical data yet).
+    """
+    records = load_today()
+    print(f"[persist] restoring {len(records)} minute records from today's file")
+    with data_lock:
+        for record in records:
+            ts = record.get("ts", "")
+            for key in EBUSCTL_FIELDS:
+                if key in record:
+                    series[key].append({"ts": ts, "value": record[key]})
+
+
 def derive_mode(latest_snap: dict) -> str:
     """Return 'dhw' | 'heating' | 'idle' based on latest values."""
-    compressor = latest_snap.get("compressor", {}).get("value", 0) or 0
+    compressor = latest_snap.get("compressor_speed", {}).get("value", 0) or 0
     valve      = latest_snap.get("three_way_valve", {}).get("value", 0) or 0
     if compressor > 0 and valve == 1:
         return "dhw"
@@ -84,8 +171,11 @@ def derive_mode(latest_snap: dict) -> str:
 
 def poll_loop():
     """Background thread: poll all configured fields every POLL_INTERVAL seconds."""
+    global _current_minute
     while True:
-        ts = datetime.now().isoformat(timespec="seconds")
+        now = datetime.now()
+        ts  = now.isoformat(timespec="seconds")
+        minute_str = now.strftime("%Y-%m-%dT%H:%M")
         updates = {}
 
         for key, (field, label, unit) in EBUSCTL_FIELDS.items():
@@ -101,6 +191,7 @@ def poll_loop():
                 series[key].append(point)
                 latest[key] = {"value": value, "unit": unit, "label": label,
                                 "raw": raw, "ts": ts}
+                _minute_bucket[key].append(value)
             updates[key] = point
 
         # Poll extra (non-chart) fields
@@ -113,6 +204,12 @@ def poll_loop():
                 continue
             with data_lock:
                 latest[key] = {"value": value, "raw": raw, "ts": ts}
+
+        # Flush completed minute to disk when the minute rolls over
+        with data_lock:
+            if _current_minute and minute_str != _current_minute:
+                _flush_minute_bucket(_current_minute)
+            _current_minute = minute_str
 
         if updates:
             with data_lock:
@@ -166,6 +263,7 @@ def index():
 @app.route("/api/history")
 def api_history():
     with data_lock:
+        # series deques already contain today's restored + live points
         out = {k: list(v) for k, v in series.items()}
         out["latest"] = dict(latest)
         out["logs"]   = list(log_lines)
@@ -510,8 +608,8 @@ function pushPoint(key, ts, value) {
   chart.data.labels.push(label);
   chart.data.datasets[0].data.push(value);
 
-  // keep last HISTORY_POINTS
-  if (chart.data.labels.length > 120) {
+  // keep last 1440 points (full day at 1 pt/min)
+  if (chart.data.labels.length > 1440) {
     chart.data.labels.shift();
     chart.data.datasets[0].data.shift();
   }
@@ -617,7 +715,17 @@ connect();
 """
 
 # ── Startup ───────────────────────────────────────────────────────────────────
+def _shutdown_flush():
+    """Flush whatever is in the current minute bucket when the process exits."""
+    with data_lock:
+        if _minute_bucket and _current_minute:
+            print(f"[persist] flushing on shutdown: {_current_minute}")
+            _flush_minute_bucket(_current_minute)
+
+atexit.register(_shutdown_flush)
+
 if __name__ == "__main__":
+    restore_today()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=tail_logs,  daemon=True).start()
     app.run(host="0.0.0.0", port=6789, debug=False, threaded=True)
