@@ -35,7 +35,7 @@ EBUSCTL_FIELDS = {
     "power_consumption": ("CurrentConsumedPower",    "Power consumption",    "kW"),
     "power_yield":      ("CurrentYieldPower",        "Power yield",          "kW"),
     "cop":              ("COP",                      "COP",                  ""),
-    "compressor_speed": ("RunDataCompressorSpeed",   "Compressor Speed",     "rpm"),
+    "compressor_speed": ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
     "energy_integral":  ("EnergyIntegral",           "Energie-integral",     "ºmin"),
 }
 
@@ -79,77 +79,109 @@ def parse_value(raw: str) -> float | None:
     return float(m.group()) if m else None
 
 
-# ── Outlier filtering ─────────────────────────────────────────────────────────
+# ── Bounds-based outlier correction ───────────────────────────────────────────
 #
-# Strategy per variable:
+# Any reading outside [lo, hi] is treated as a glitch and replaced with a
+# linear interpolation of its surrounding good neighbours (up to 2 consecutive
+# bad points are handled).
 #
-#  "rate"   – reject if the delta from the last accepted value exceeds max_delta.
-#             Used for slow-moving physical quantities (temperatures, flow).
-#             zero_when_idle: if True AND compressor_speed == 0, a value of 0
-#             is always accepted regardless of delta (pump/heat genuinely off).
+# Values are accepted as-is once they return inside bounds — no rate-of-change
+# logic, no relative thresholds. Bounds are set to realistic physical limits
+# with generous headroom so no legitimate reading is ever rejected.
 #
-#  "bounds" – reject if outside [lo, hi].
-#             Used for quantities that can change abruptly but have known
-#             physical limits (power, COP).
-#             cop also gets special-cased: ignored when compressor is off.
-#
-#  None     – no filtering. Used for compressor_speed (step changes are real)
-#             and energy_integral (accumulator, resets are legitimate).
-#
-FILTER_CFG: dict[str, dict] = {
-    "flow_temp":        {"kind": "rate", "max_delta": 5.0},
-    "target_flow_temp": {"kind": "rate", "max_delta": 5.0},
-    "return_temp":      {"kind": "rate", "max_delta": 5.0},
-    "outside_temp":     {"kind": "rate", "max_delta": 3.0},
-    "air_intake_temp":  {"kind": "rate", "max_delta": 5.0},
-    "dhw_temp":         {"kind": "rate", "max_delta": 5.0},
-    "flow":             {"kind": "rate", "max_delta": 300.0, "zero_when_idle": True},
-    "power_consumption":{"kind": "bounds", "lo": 0.0,  "hi": 20.0},
-    "power_yield":      {"kind": "bounds", "lo": 0.0,  "hi": 30.0},
-    "cop":              {"kind": "bounds", "lo": 0.0,  "hi": 10.0, "hide_when_idle": True},
-    "compressor_speed": None,   # step changes to 0 and back are physically real
-    "energy_integral":  None,   # running accumulator; resets/jumps are legitimate
+BOUNDS: dict[str, tuple[float, float]] = {
+    #                       lo       hi
+    "flow_temp":         ( -5.0,    90.0),   # °C  — freeze to boiling headroom
+    "target_flow_temp":  ( -5.0,    90.0),   # °C
+    "return_temp":       ( -5.0,    80.0),   # °C
+    "outside_temp":      (-30.0,    50.0),   # °C  — realistic NL range + margin
+    "air_intake_temp":   (-30.0,    60.0),   # °C
+    "dhw_temp":          (  5.0,    80.0),   # °C
+    "flow":              (  0.0,  3000.0),   # l/h
+    "power_consumption": (  0.0,    15.0),   # kW
+    "power_yield":       (  0.0,    20.0),   # kW
+    "cop":               (  0.0,    10.0),   # –
+    "compressor_speed":  (  0.0,   200.0),   # rps
+    "energy_integral":   (-300.0,  50.0),    # ºmin
 }
 
-# Last accepted value per key, for rate-of-change checks
-_last_accepted: dict[str, float] = {}
+# Rolling window of the last 5 raw (unfiltered) readings per key
+_WINDOW  = 5
+_windows: dict[str, deque] = {k: deque(maxlen=_WINDOW) for k in BOUNDS}
 
 
-def filter_value(key: str, value: float, compressor_on: bool) -> bool:
+def _patch_series(series_deque: deque, ts: str, value: float):
+    """Overwrite the most recent entry with matching ts in series_deque."""
+    for i in range(len(series_deque) - 1, -1, -1):
+        if series_deque[i]["ts"] == ts:
+            series_deque[i] = {**series_deque[i], "value": value}
+            return
+
+
+def _in_bounds(key: str, value: float) -> bool:
+    lo, hi = BOUNDS[key]
+    return lo <= value <= hi
+
+
+def check_and_correct(key: str, series_deque: deque) -> list[dict]:
     """
-    Return True if the value should be accepted, False if it should be dropped.
-    Must be called WITHOUT data_lock held (reads _last_accepted under its own lock).
+    Called after a new raw point has been appended to _windows[key].
+
+    Scans the window from oldest to newest. Any run of 1 or 2 consecutive
+    out-of-bounds points that is flanked by in-bounds points on both sides
+    is replaced by linear interpolation between those flanking points.
+
+    Returns a list of {ts, value} correction dicts to broadcast (may be empty).
     """
-    cfg = FILTER_CFG.get(key)
-    if cfg is None:
-        # No filter configured → always accept
-        _last_accepted[key] = value
-        return True
+    if key not in BOUNDS:
+        return []
 
-    if cfg["kind"] == "rate":
-        # Zero is real when the system is idle for flow-like quantities
-        if value == 0.0 and cfg.get("zero_when_idle") and not compressor_on:
-            _last_accepted[key] = value
-            return True
-        prev = _last_accepted.get(key)
-        if prev is not None and abs(value - prev) > cfg["max_delta"]:
-            print(f"[filter] {key}: rejected {value} (prev={prev}, "
-                  f"delta={abs(value-prev):.1f} > {cfg['max_delta']})")
-            return False
-        _last_accepted[key] = value
-        return True
+    win = list(_windows[key])   # snapshot; indices are stable during iteration
+    n   = len(win)
+    corrections = []
+    i = 0
 
-    if cfg["kind"] == "bounds":
-        # COP is meaningless when the compressor is off; skip rather than record 0
-        if cfg.get("hide_when_idle") and not compressor_on:
-            return False
-        if not (cfg["lo"] <= value <= cfg["hi"]):
-            print(f"[filter] {key}: rejected {value} (bounds [{cfg['lo']}, {cfg['hi']}])")
-            return False
-        _last_accepted[key] = value
-        return True
+    while i < n:
+        if _in_bounds(key, win[i]["value"]):
+            i += 1
+            continue
 
-    return True
+        # Found an out-of-bounds point at i — look ahead for the run length
+        run_end = i + 1
+        while run_end < n and not _in_bounds(key, win[run_end]["value"]):
+            run_end += 1
+
+        run_len = run_end - i   # number of consecutive bad points
+
+        # We can only interpolate if there's a good anchor on both sides
+        # and the run is ≤ 2 (longer runs may be a real state change)
+        if run_len <= 2 and i > 0 and run_end < n:
+            left_val  = win[i - 1]["value"]
+            right_val = win[run_end]["value"]
+            steps     = run_len + 1   # intervals between left anchor and right anchor
+
+            for offset in range(run_len):
+                pt    = win[i + offset]
+                interp = round(left_val + (right_val - left_val) * (offset + 1) / steps, 3)
+                print(f"[bounds] {key}: {pt['value']} out of {BOUNDS[key]}, "
+                      f"corrected → {interp}")
+                # Patch the window snapshot and the live series deque
+                win[i + offset] = {**pt, "value": interp}
+                _patch_series(series_deque, pt["ts"], interp)
+                corrections.append({"ts": pt["ts"], "value": interp})
+
+            # Write corrected values back into the real deque-based window
+            real_win = _windows[key]
+            for offset in range(run_len):
+                idx_from_end = n - (i + offset) - 1
+                # deque doesn't support negative-index assignment; use rotation
+                real_win.rotate(idx_from_end + 1)
+                real_win[0] = win[i + offset]
+                real_win.rotate(-(idx_from_end + 1))
+
+        i = run_end   # skip past the run (corrected or too long)
+
+    return corrections
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -253,18 +285,12 @@ def poll_loop():
         minute_str = now.strftime("%Y-%m-%dT%H:%M")
         updates = {}
 
-        # Determine compressor state before filtering (use last known value)
-        with data_lock:
-            compressor_on = (latest.get("compressor_speed", {}).get("value", 0) or 0) > 0
-
         for key, (field, label, unit) in EBUSCTL_FIELDS.items():
             raw = run_ebusctl(field)
             if raw is None:
                 continue
             value = parse_value(raw)
             if value is None:
-                continue
-            if not filter_value(key, value, compressor_on):
                 continue
 
             point = {"ts": ts, "value": value}
@@ -273,6 +299,23 @@ def poll_loop():
                 latest[key] = {"value": value, "unit": unit, "label": label,
                                 "raw": raw, "ts": ts}
                 _minute_bucket[key].append(value)
+
+                # Feed the trailing window and correct any out-of-bounds points
+                if key in _windows:
+                    _windows[key].append(point)
+                    corrections = check_and_correct(key, series[key])
+                    for correction in corrections:
+                        updates.setdefault("_fixes", []).append({**correction, "key": key})
+                    # Patch the minute bucket: corrections refer to recently
+                    # appended values; find them by value match from the end
+                    # (bucket has no timestamps, but bad values are distinctive)
+                    for correction in corrections:
+                        bucket = _minute_bucket[key]
+                        for i in range(len(bucket) - 1, -1, -1):
+                            if bucket[i] != correction["value"]:
+                                bucket[i] = correction["value"]
+                                break
+
             updates[key] = point
 
         # Poll extra (non-chart) fields — store raw string, not just numeric parse
@@ -677,6 +720,18 @@ function updateMode(mode) {
   bD.className = 'badge' + (mode === 'dhw'     ? ' active-dhw'     : '');
 }
 
+// ── Retroactively patch a spike in the chart ─────────────────────────────────
+function fixPoint(key, ts, value) {
+  const chart = chartMap[key];
+  if (!chart) return;
+  const label = ts.substring(11, 19);
+  const idx = chart.data.labels.lastIndexOf(label);
+  if (idx !== -1) {
+    chart.data.datasets[0].data[idx] = value;
+    chart.update('none');
+  }
+}
+
 // ── Push a data point into chart + KPI ──────────────────────────────────────
 function pushPoint(key, ts, value) {
   if (!(key in chartMap)) return;
@@ -746,8 +801,12 @@ function connect() {
     document.getElementById('last-update').textContent = 'last update: ' + now;
 
     if (msg.type === 'snapshot' || msg.type === 'update') {
-      for (const [key, point] of Object.entries(msg.data)) {
+      for (const [key, point] of Object.entries(msg.data || {})) {
+        if (key === '_fixes') continue;
         if (point) pushPoint(key, point.ts, point.value);
+      }
+      for (const fix of (msg.data?._fixes || [])) {
+        fixPoint(fix.key, fix.ts, fix.value);
       }
       if (msg.mode) updateMode(msg.mode);
     }
