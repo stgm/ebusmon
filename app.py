@@ -40,6 +40,7 @@ EBUSCTL_FIELDS = {
     "heat_curve":       ("HeatCurve",                "Heat curve",           ""),
     "target_room_temp": ("TargetTempHc",             "Target room temp",     "ºC"),
     "target_hwc_temp":  ("TargetTempHwc",            "Target DHW temp",      "ºC"),
+    "flow_pressure":    ("FlowPressure",             "Flow pressure",        "bar"),
 }
 
 # Extra fields polled for mode indicators but NOT shown as charts
@@ -110,6 +111,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "heat_curve":        (  0.0,    5.0),    # dimensionless — typical range 0.2–3.0
     "target_room_temp":  ( 10.0,   30.0),    # °C
     "target_hwc_temp":   ( 10.0,   80.0),    # °C
+    "flow_pressure":     (  0.0,    5.0),    # bar
 }
 
 # Rolling window of the last 5 raw (unfiltered) readings per key
