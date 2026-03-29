@@ -39,6 +39,7 @@ EBUSCTL_FIELDS = {
     "energy_integral":  ("EnergyIntegral",           "Energie-integral",     "ºmin"),
     "heat_curve":       ("HeatCurve",                "Heat curve",           ""),
     "target_room_temp": ("TargetTempHc",             "Target room temp",     "ºC"),
+    "target_hwc_temp":  ("TargetTempHwc",            "Target DHW temp",      "ºC"),
 }
 
 # Extra fields polled for mode indicators but NOT shown as charts
@@ -108,6 +109,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "energy_integral":   (-300.0,  50.0),    # ºmin
     "heat_curve":        (  0.0,    5.0),    # dimensionless — typical range 0.2–3.0
     "target_room_temp":  ( 10.0,   30.0),    # °C
+    "target_hwc_temp":   ( 10.0,   80.0),    # °C
 }
 
 # Rolling window of the last 5 raw (unfiltered) readings per key
@@ -434,6 +436,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>eBUS Heat Pump Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap" rel="stylesheet">
 <style>
@@ -682,18 +685,23 @@ function buildUI() {
 
     const ctx = card.querySelector(`#chart-${key}`).getContext('2d');
     const color = PALETTE[ci++ % PALETTE.length];
+
+    // Full-day time bounds — recalculated at midnight if the page stays open
+    const dayStart = new Date(); dayStart.setHours(0,0,0,0);
+    const dayEnd   = new Date(); dayEnd.setHours(23,59,59,999);
+
     chartMap[key] = new Chart(ctx, {
       type: 'line',
       data: {
-        labels: [],
         datasets: [{
-          data: [],
+          data: [],          // {x: Date, y: value} objects
           borderColor: color,
           backgroundColor: color + '18',
           borderWidth: 1.5,
           pointRadius: 0,
           tension: 0.3,
           fill: true,
+          spanGaps: false,   // break line where data is missing
         }]
       },
       options: {
@@ -703,9 +711,17 @@ function buildUI() {
         plugins: { legend: { display: false } },
         scales: {
           x: {
+            type: 'time',
+            min: dayStart,
+            max: dayEnd,
+            time: {
+              unit: 'hour',
+              displayFormats: { hour: 'HH:mm' },
+              tooltipFormat: 'HH:mm:ss',
+            },
             ticks: { color: '#4a6070', font: { family: "'Share Tech Mono'", size: 9 },
-                     maxTicksLimit: 8, maxRotation: 0 },
-            grid:  { color: '#0f1e2e' }
+                     maxTicksLimit: 12, maxRotation: 0 },
+            grid: { color: '#0f1e2e' }
           },
           y: {
             ticks: { color: '#4a6070', font: { family: "'Share Tech Mono'", size: 9 } },
@@ -725,32 +741,40 @@ function updateMode(mode) {
   bD.className = 'badge' + (mode === 'dhw'     ? ' active-dhw'     : '');
 }
 
-// ── Retroactively patch a spike in the chart ─────────────────────────────────
+// ── Retroactively patch an out-of-bounds point in the chart ──────────────────
 function fixPoint(key, ts, value) {
   const chart = chartMap[key];
   if (!chart) return;
-  const label = ts.substring(11, 19);
-  const idx = chart.data.labels.lastIndexOf(label);
-  if (idx !== -1) {
-    chart.data.datasets[0].data[idx] = value;
-    chart.update('none');
+  const t = new Date(ts).getTime();
+  const data = chart.data.datasets[0].data;
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (data[i].x.getTime() === t) {
+      data[i] = { x: data[i].x, y: value };
+      chart.update('none');
+      break;
+    }
   }
 }
 
 // ── Push a data point into chart + KPI ──────────────────────────────────────
+const GAP_MS = 3 * 60 * 1000;   // gap threshold: 3 minutes
+
 function pushPoint(key, ts, value) {
   if (!(key in chartMap)) return;
   const chart = chartMap[key];
-  const label = ts.substring(11, 19);    // HH:MM:SS
+  const data  = chart.data.datasets[0].data;
+  const t     = new Date(ts);
 
-  chart.data.labels.push(label);
-  chart.data.datasets[0].data.push(value);
-
-  // keep last 1440 points (full day at 1 pt/min)
-  if (chart.data.labels.length > 1440) {
-    chart.data.labels.shift();
-    chart.data.datasets[0].data.shift();
+  // If the previous point is more than GAP_MS ago, bracket the gap with nulls
+  if (data.length > 0) {
+    const prevT = data[data.length - 1].x;
+    if (prevT && (t - prevT) > GAP_MS) {
+      data.push({ x: new Date(prevT.getTime() + 1), y: null });
+      data.push({ x: new Date(t.getTime()    - 1), y: null });
+    }
   }
+
+  data.push({ x: t, y: value });
   chart.update('none');
 
   // update KPI
@@ -828,7 +852,7 @@ async function loadHistory() {
     const h = await r.json();
 
     for (const [key, points] of Object.entries(h)) {
-      if (key === 'latest' || key === 'logs' || !Array.isArray(points)) continue;
+      if (key === 'latest' || key === 'logs' || key === 'mode' || !Array.isArray(points)) continue;
       points.forEach(p => pushPoint(key, p.ts, p.value));
     }
 
