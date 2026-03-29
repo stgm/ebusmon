@@ -79,6 +79,79 @@ def parse_value(raw: str) -> float | None:
     return float(m.group()) if m else None
 
 
+# ── Outlier filtering ─────────────────────────────────────────────────────────
+#
+# Strategy per variable:
+#
+#  "rate"   – reject if the delta from the last accepted value exceeds max_delta.
+#             Used for slow-moving physical quantities (temperatures, flow).
+#             zero_when_idle: if True AND compressor_speed == 0, a value of 0
+#             is always accepted regardless of delta (pump/heat genuinely off).
+#
+#  "bounds" – reject if outside [lo, hi].
+#             Used for quantities that can change abruptly but have known
+#             physical limits (power, COP).
+#             cop also gets special-cased: ignored when compressor is off.
+#
+#  None     – no filtering. Used for compressor_speed (step changes are real)
+#             and energy_integral (accumulator, resets are legitimate).
+#
+FILTER_CFG: dict[str, dict] = {
+    "flow_temp":        {"kind": "rate", "max_delta": 5.0},
+    "target_flow_temp": {"kind": "rate", "max_delta": 5.0},
+    "return_temp":      {"kind": "rate", "max_delta": 5.0},
+    "outside_temp":     {"kind": "rate", "max_delta": 3.0},
+    "air_intake_temp":  {"kind": "rate", "max_delta": 5.0},
+    "dhw_temp":         {"kind": "rate", "max_delta": 5.0},
+    "flow":             {"kind": "rate", "max_delta": 300.0, "zero_when_idle": True},
+    "power_consumption":{"kind": "bounds", "lo": 0.0,  "hi": 20.0},
+    "power_yield":      {"kind": "bounds", "lo": 0.0,  "hi": 30.0},
+    "cop":              {"kind": "bounds", "lo": 0.0,  "hi": 10.0, "hide_when_idle": True},
+    "compressor_speed": None,   # step changes to 0 and back are physically real
+    "energy_integral":  None,   # running accumulator; resets/jumps are legitimate
+}
+
+# Last accepted value per key, for rate-of-change checks
+_last_accepted: dict[str, float] = {}
+
+
+def filter_value(key: str, value: float, compressor_on: bool) -> bool:
+    """
+    Return True if the value should be accepted, False if it should be dropped.
+    Must be called WITHOUT data_lock held (reads _last_accepted under its own lock).
+    """
+    cfg = FILTER_CFG.get(key)
+    if cfg is None:
+        # No filter configured → always accept
+        _last_accepted[key] = value
+        return True
+
+    if cfg["kind"] == "rate":
+        # Zero is real when the system is idle for flow-like quantities
+        if value == 0.0 and cfg.get("zero_when_idle") and not compressor_on:
+            _last_accepted[key] = value
+            return True
+        prev = _last_accepted.get(key)
+        if prev is not None and abs(value - prev) > cfg["max_delta"]:
+            print(f"[filter] {key}: rejected {value} (prev={prev}, "
+                  f"delta={abs(value-prev):.1f} > {cfg['max_delta']})")
+            return False
+        _last_accepted[key] = value
+        return True
+
+    if cfg["kind"] == "bounds":
+        # COP is meaningless when the compressor is off; skip rather than record 0
+        if cfg.get("hide_when_idle") and not compressor_on:
+            return False
+        if not (cfg["lo"] <= value <= cfg["hi"]):
+            print(f"[filter] {key}: rejected {value} (bounds [{cfg['lo']}, {cfg['hi']}])")
+            return False
+        _last_accepted[key] = value
+        return True
+
+    return True
+
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 def _day_file(d: date) -> Path:
     DATA_DIR.mkdir(exist_ok=True)
@@ -178,12 +251,18 @@ def poll_loop():
         minute_str = now.strftime("%Y-%m-%dT%H:%M")
         updates = {}
 
+        # Determine compressor state before filtering (use last known value)
+        with data_lock:
+            compressor_on = (latest.get("compressor_speed", {}).get("value", 0) or 0) > 0
+
         for key, (field, label, unit) in EBUSCTL_FIELDS.items():
             raw = run_ebusctl(field)
             if raw is None:
                 continue
             value = parse_value(raw)
             if value is None:
+                continue
+            if not filter_value(key, value, compressor_on):
                 continue
 
             point = {"ts": ts, "value": value}
