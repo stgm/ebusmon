@@ -37,6 +37,8 @@ EBUSCTL_FIELDS = {
     "cop":              ("COP",                      "COP",                  ""),
     "compressor_speed": ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
     "energy_integral":  ("EnergyIntegral",           "Energie-integral",     "ºmin"),
+    "heat_curve":       ("HeatCurve",                "Heat curve",           ""),
+    "target_room_temp": ("TargetTempHc",             "Target room temp",     "ºC"),
 }
 
 # Extra fields polled for mode indicators but NOT shown as charts
@@ -104,6 +106,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "cop":               (  0.0,    10.0),   # –
     "compressor_speed":  (  0.0,   200.0),   # rps
     "energy_integral":   (-300.0,  50.0),    # ºmin
+    "heat_curve":        (  0.0,    5.0),    # dimensionless — typical range 0.2–3.0
+    "target_room_temp":  ( 10.0,   30.0),    # °C
 }
 
 # Rolling window of the last 5 raw (unfiltered) readings per key
