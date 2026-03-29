@@ -234,8 +234,10 @@ def restore_today():
 def derive_mode(latest_snap: dict) -> str:
     """Return 'dhw' | 'heating' | 'idle' based on latest values."""
     compressor = latest_snap.get("compressor_speed", {}).get("value", 0) or 0
-    valve      = latest_snap.get("three_way_valve", {}).get("value", 0) or 0
-    if compressor > 0 and valve == 1:
+    # ThreeWayValve returns a string like "warm water circuit" or "heating circuit"
+    valve_raw  = str(latest_snap.get("three_way_valve", {}).get("value", "")).lower()
+    valve_dhw  = "warm water" in valve_raw or "dhw" in valve_raw
+    if compressor > 0 and valve_dhw:
         return "dhw"
     if compressor > 0:
         return "heating"
@@ -273,16 +275,13 @@ def poll_loop():
                 _minute_bucket[key].append(value)
             updates[key] = point
 
-        # Poll extra (non-chart) fields
+        # Poll extra (non-chart) fields — store raw string, not just numeric parse
         for key, field in EXTRA_FIELDS.items():
             raw = run_ebusctl(field)
             if raw is None:
                 continue
-            value = parse_value(raw)
-            if value is None:
-                continue
             with data_lock:
-                latest[key] = {"value": value, "raw": raw, "ts": ts}
+                latest[key] = {"value": raw, "raw": raw, "ts": ts}
 
         # Flush completed minute to disk when the minute rolls over
         with data_lock:
