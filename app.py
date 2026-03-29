@@ -73,10 +73,11 @@ def run_ebusctl(field: str) -> str | None:
 
 
 def parse_value(raw: str) -> float | None:
-    """Extract the first numeric value from an ebusctl response."""
-    # Handles: "858 l/h", "22.5", "22;292;193;8" (take first), etc.
-    m = re.search(r"-?\d+(?:\.\d+)?", raw)
-    return float(m.group()) if m else None
+    """Extract the first numeric value from an ebusctl response.
+    Handles plain decimals, negatives, and scientific notation (e.g. 2.3549e-38).
+    """
+    m = re.search(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", raw)
+    return round(float(m.group()), 4) if m else None
 
 
 # ── Bounds-based outlier correction ───────────────────────────────────────────
