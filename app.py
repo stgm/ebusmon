@@ -1,8 +1,8 @@
 """
 ebusd Live Dashboard - Flask Backend
-Polls ebusctl for heat pump metrics and serves SSE to the frontend.
+Uses pyebus to communicate directly with ebusd over TCP.
 """
-import subprocess
+import asyncio
 import threading
 import time
 import json
@@ -17,33 +17,40 @@ from flask import Flask, Response, render_template_string, jsonify
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-DOCKER_CONTAINER = "ebusd"                 # change to your container name/id
-POLL_INTERVAL    = 5                       # seconds between ebusctl polls
-HISTORY_POINTS   = 1440                    # one per minute × 24 h = full day in memory
-DATA_DIR         = Path("data")            # where daily .jsonl files are stored
+EBUSD_HOST     = "192.168.178.27"              # ebusd TCP host
+EBUSD_PORT     = 8888                     # ebusd TCP port
+POLL_INTERVAL  = 5                        # seconds between poll cycles
+HISTORY_POINTS = 1440                     # one per minute × 24 h = full day in memory
+DATA_DIR       = Path("data")             # where daily .jsonl files are stored
+# TTL passed to async_read: accept cached values up to this many seconds old.
+# ebusd won't go to the bus more often than needed; this just means we accept
+# the cached value rather than forcing a fresh bus read every poll cycle.
+READ_TTL       = POLL_INTERVAL * 2
 
-# Fields to poll via: ebusctl read -f <field>
-# Format: { "key": ("ebusctl_field_name", "display_label", "unit") }
+# Fields to read via pyebus.
+# Format: { "key": ("ebusd_field_name", "display_label", "unit") }
+# The field name is matched against msgdef.name (case-insensitive).
 EBUSCTL_FIELDS = {
-    "flow":             ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
-    "flow_temp":        ("FlowTemp",                 "Flow Temp",            "°C"),
-    "target_flow_temp": ("TargetFlowTemp",           "Target Flow Temp",     "°C"),
-    "return_temp":      ("RunDataReturnTemp",         "Return Temp",          "°C"),
-    "outside_temp":     ("OutdoorTemp",              "Outside Temp",         "°C"),
-    "air_intake_temp":  ("AirIntakeTemp",            "Temp on back of pump", "°C"),
-    "dhw_temp":         ("HwcTemp",                  "DHW Temp",             "°C"),
-    "power_consumption": ("CurrentConsumedPower",    "Power consumption",    "kW"),
-    "power_yield":      ("CurrentYieldPower",        "Power yield",          "kW"),
-    "cop":              ("COP",                      "COP",                  ""),
-    "compressor_speed": ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
-    "energy_integral":  ("EnergyIntegral",           "Energie-integral",     "ºmin"),
-    "heat_curve":       ("HeatCurve",                "Heat curve",           ""),
-    "target_room_temp": ("TargetTempHc",             "Target room temp",     "ºC"),
-    "target_hwc_temp":  ("TargetTempHwc",            "Target DHW temp",      "ºC"),
-    "flow_pressure":    ("FlowPressure",             "Flow pressure",        "bar"),
+    "flow":              ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
+    "flow_temp":         ("FlowTemp",                 "Flow Temp",            "°C"),
+    "target_flow_temp":  ("TargetFlowTemp",           "Target Flow Temp",     "°C"),
+    "return_temp":       ("RunDataReturnTemp",         "Return Temp",          "°C"),
+    "outside_temp":      ("OutdoorTemp",              "Outside Temp",         "°C"),
+    "air_intake_temp":   ("AirIntakeTemp",            "Temp on back of pump", "°C"),
+    "dhw_temp":          ("HwcTemp",                  "DHW Temp",             "°C"),
+    "power_consumption": ("CurrentConsumedPower",     "Power consumption",    "kW"),
+    "power_yield":       ("CurrentYieldPower",        "Power yield",          "kW"),
+    "cop":               ("COP",                      "COP",                  ""),
+    "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
+    "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
+    "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
+    "target_room_temp":  ("TargetTempHc",             "Target room temp",     "ºC"),
+    "target_hwc_temp":   ("TargetTempHwc",            "Target DHW temp",      "ºC"),
+    "flow_pressure":     ("FlowPressure",             "Flow pressure",        "bar"),
 }
 
-# Extra fields polled for mode indicators but NOT shown as charts
+# Extra fields for mode indicators only (not charted).
+# Value may be a string (e.g. "warm water circuit") so we store raw.
 EXTRA_FIELDS = {
     "three_way_valve": "ThreeWayValve",
 }
@@ -51,37 +58,76 @@ EXTRA_FIELDS = {
 # ── Shared state ─────────────────────────────────────────────────────────────
 data_lock    = threading.Lock()
 series: dict[str, deque] = {k: deque(maxlen=HISTORY_POINTS) for k in EBUSCTL_FIELDS}
-latest: dict[str, dict]  = {}          # { key: {value, unit, label, ts} }
+latest: dict[str, dict]  = {}
 log_lines: deque          = deque(maxlen=200)
 sse_clients: list         = []
 
-# Accumulator for per-minute averaging before writing to disk
-_minute_bucket: dict[str, list] = defaultdict(list)   # key → [values in current minute]
-_current_minute: str             = ""                  # "YYYY-MM-DDTHH:MM"
+_minute_bucket: dict[str, list] = defaultdict(list)
+_current_minute: str             = ""
+
+# Shared asyncio event loop running in background thread
+_loop: asyncio.AbstractEventLoop | None = None
 
 
-# ── ebusctl helpers ──────────────────────────────────────────────────────────
-def run_ebusctl(field: str) -> str | None:
-    """Run ebusctl read -f <field> inside Docker and return the value string."""
-    try:
-        result = subprocess.run(
-            ["docker", "exec", DOCKER_CONTAINER, "ebusctl", "read", "-f", field],
-            capture_output=True, text=True, timeout=8
-        )
-        out = result.stdout.strip()
-        if out and "ERR" not in out.upper():
-            return out
-    except Exception as e:
-        print(f"[ebusctl] {field}: {e}")
-    return None
+# ── pyebus helpers ────────────────────────────────────────────────────────────
+def _run_async(coro):
+    """Submit a coroutine to the shared event loop and block until done."""
+    fut = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return fut.result(timeout=15)
 
 
-def parse_value(raw: str) -> float | None:
-    """Extract the first numeric value from an ebusctl response.
-    Handles plain decimals, negatives, and scientific notation (e.g. 2.3549e-38).
+async def _make_ebus():
+    """Create and connect an Ebus instance with msgdefs loaded."""
+    from pyebus import Ebus
+    ebus = Ebus(EBUSD_HOST, port=EBUSD_PORT)
+    await ebus.async_load_msgdefs()
+    return ebus
+
+
+def _build_field_map(ebus) -> dict[str, object]:
     """
-    m = re.search(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", raw)
-    return round(float(m.group()), 4) if m else None
+    Build a dict mapping lowercase field_name → (msgdef, fielddef).
+    Indexes by fielddef.name, and also by just the last component after '/'
+    so that e.g. "RunDataCompressorSpeed/value" is also reachable as "value"
+    -- but the full name takes priority to avoid collisions.
+    Also indexes by msgdef.name alone (the message name, without circuit prefix)
+    since that's what ebusctl uses.
+    """
+    field_map = {}
+    # First pass: index by msgdef.name (message-level, no field suffix)
+    for msgdef in ebus.msgdefs:
+        mname = msgdef.name.lower()
+        if mname not in field_map:
+            # Use first fielddef as representative
+            fields = list(msgdef.fields)
+            if fields:
+                field_map[mname] = (msgdef, fields[0])
+    # Second pass: index by fielddef.name (may override message-level if more specific)
+    for msgdef in ebus.msgdefs:
+        for fielddef in msgdef.fields:
+            fname = fielddef.name.lower()
+            field_map[fname] = (msgdef, fielddef)
+            # Also index by last component after '/' (e.g. "rundatacompressorspeed/value" → "value")
+            if "/" in fname:
+                short = fname.split("/")[-1]
+                if short not in field_map:
+                    field_map[short] = (msgdef, fielddef)
+    return field_map
+
+
+def parse_value(raw) -> float | None:
+    """
+    Convert a pyebus field value to float.
+    pyebus returns typed values (float, int, str).  For strings that look
+    like numbers (including scientific notation) we parse them; for pure
+    strings (e.g. ThreeWayValve) we return None so the caller stores raw.
+    """
+    if isinstance(raw, (int, float)):
+        return round(float(raw), 4)
+    if isinstance(raw, str):
+        m = re.search(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", raw)
+        return round(float(m.group()), 4) if m else None
+    return None
 
 
 # ── Bounds-based outlier correction ───────────────────────────────────────────
@@ -285,20 +331,32 @@ def derive_mode(latest_snap: dict) -> str:
     return "idle"
 
 
-def poll_loop():
-    """Background thread: poll all configured fields every POLL_INTERVAL seconds."""
+async def _async_poll_loop(ebus, field_map: dict):
+    """Async poll loop: reads all configured fields every POLL_INTERVAL seconds."""
     global _current_minute
     while True:
-        now = datetime.now()
-        ts  = now.isoformat(timespec="seconds")
+        now        = datetime.now()
+        ts         = now.isoformat(timespec="seconds")
         minute_str = now.strftime("%Y-%m-%dT%H:%M")
-        updates = {}
+        updates    = {}
 
-        for key, (field, label, unit) in EBUSCTL_FIELDS.items():
-            raw = run_ebusctl(field)
-            if raw is None:
+        # ── Chart fields ──────────────────────────────────────────────────────
+        for key, (fname, label, unit) in EBUSCTL_FIELDS.items():
+            entry = field_map.get(fname.lower())
+            if entry is None:
                 continue
-            value = parse_value(raw)
+            msgdef, _ = entry
+            try:
+                msg = await ebus.async_read(msgdef, ttl=READ_TTL)
+                if msg is None:
+                    continue
+                # msg.values is a tuple of field values in order
+                raw_val = msg.values[0] if len(msg.values) == 1 else msg.values
+            except Exception as e:
+                print(f"[pyebus] {fname}: {e}")
+                continue
+
+            value = parse_value(raw_val)
             if value is None:
                 continue
 
@@ -306,18 +364,14 @@ def poll_loop():
             with data_lock:
                 series[key].append(point)
                 latest[key] = {"value": value, "unit": unit, "label": label,
-                                "raw": raw, "ts": ts}
+                                "raw": str(raw_val), "ts": ts}
                 _minute_bucket[key].append(value)
 
-                # Feed the trailing window and correct any out-of-bounds points
                 if key in _windows:
                     _windows[key].append(point)
                     corrections = check_and_correct(key, series[key])
                     for correction in corrections:
                         updates.setdefault("_fixes", []).append({**correction, "key": key})
-                    # Patch the minute bucket: corrections refer to recently
-                    # appended values; find them by value match from the end
-                    # (bucket has no timestamps, but bad values are distinctive)
                     for correction in corrections:
                         bucket = _minute_bucket[key]
                         for i in range(len(bucket) - 1, -1, -1):
@@ -327,15 +381,24 @@ def poll_loop():
 
             updates[key] = point
 
-        # Poll extra (non-chart) fields — store raw string, not just numeric parse
-        for key, field in EXTRA_FIELDS.items():
-            raw = run_ebusctl(field)
-            if raw is None:
+        # ── Extra (mode indicator) fields ─────────────────────────────────────
+        for key, fname in EXTRA_FIELDS.items():
+            entry = field_map.get(fname.lower())
+            if entry is None:
+                continue
+            msgdef, _ = entry
+            try:
+                msg = await ebus.async_read(msgdef, ttl=READ_TTL)
+                if msg is None:
+                    continue
+                raw_val = msg.values[0] if len(msg.values) == 1 else msg.values
+            except Exception as e:
+                print(f"[pyebus] {fname}: {e}")
                 continue
             with data_lock:
-                latest[key] = {"value": raw, "raw": raw, "ts": ts}
+                latest[key] = {"value": str(raw_val), "raw": str(raw_val), "ts": ts}
 
-        # Flush completed minute to disk when the minute rolls over
+        # ── Minute flush ──────────────────────────────────────────────────────
         with data_lock:
             if _current_minute and minute_str != _current_minute:
                 _flush_minute_bucket(_current_minute)
@@ -347,25 +410,36 @@ def poll_loop():
             _broadcast(json.dumps({"type": "update", "ts": ts,
                                    "data": updates, "mode": mode}))
 
-        time.sleep(POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
 
 
-# ── Log tail (optional) ──────────────────────────────────────────────────────
-def tail_logs():
-    """Tail docker logs and forward [update notice] lines to SSE clients."""
+async def _async_main():
+    """Entry point for the background asyncio loop."""
+    print("[pyebus] connecting to ebusd…")
     try:
-        proc = subprocess.Popen(
-            ["docker", "logs", "-f", "--tail", "0", DOCKER_CONTAINER],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-        for line in proc.stdout:
-            line = line.strip()
-            if "[update notice]" in line:
-                with data_lock:
-                    log_lines.append(line)
-                _broadcast(json.dumps({"type": "log", "line": line}))
+        ebus = await _make_ebus()
     except Exception as e:
-        print(f"[tail_logs] {e}")
+        print(f"[pyebus] failed to connect: {e}")
+        return
+
+    print(f"[pyebus] loaded {sum(1 for _ in ebus.msgdefs)} message definitions")
+    field_map = _build_field_map(ebus)
+    print(f"[pyebus] indexed {len(field_map)} fields")
+
+    missing = ({v[0].lower() for v in EBUSCTL_FIELDS.values()} |
+               {v.lower() for v in EXTRA_FIELDS.values()}) - set(field_map.keys())
+    if missing:
+        print(f"[pyebus] WARNING: fields not found in msgdefs: {missing}")
+
+    await _async_poll_loop(ebus, field_map)
+
+
+def _start_async_loop():
+    """Start the asyncio event loop in a background thread."""
+    global _loop
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    _loop.run_until_complete(_async_main())
 
 
 # ── SSE broadcast ─────────────────────────────────────────────────────────────
@@ -581,7 +655,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   canvas { width: 100% !important; }
 
-  /* Log panel */
+  .log-section { display: none; }
   .log-section { padding: 1rem 1.4rem; border-top: 1px solid var(--border); }
   .log-header { font-size: .7rem; text-transform: uppercase; letter-spacing: .12em;
                 color: var(--muted); margin-bottom: .6rem; font-family: var(--mono); }
@@ -894,6 +968,5 @@ atexit.register(_shutdown_flush)
 
 if __name__ == "__main__":
     restore_today()
-    threading.Thread(target=poll_loop, daemon=True).start()
-    threading.Thread(target=tail_logs,  daemon=True).start()
+    threading.Thread(target=_start_async_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=6789, debug=False, threaded=True)
