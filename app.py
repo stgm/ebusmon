@@ -671,25 +671,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   canvas { width: 100% !important; }
 
   .log-section { display: none; }
-  .log-section { padding: 1rem 1.4rem; border-top: 1px solid var(--border); }
-  .log-header { font-size: .7rem; text-transform: uppercase; letter-spacing: .12em;
-                color: var(--muted); margin-bottom: .6rem; font-family: var(--mono); }
-  #log-box {
-    background: #050a0f;
-    border: 1px solid var(--border);
-    border-radius: 2px;
-    padding: .6rem .8rem;
-    height: 160px;
-    overflow-y: auto;
-    font-family: var(--mono);
-    font-size: .7rem;
-    color: #5a8a9a;
-    line-height: 1.5;
-  }
-  #log-box .ln { display: block; }
-  #log-box .ln .ts  { color: var(--muted); }
-  #log-box .ln .msg { color: #7ab8cc; }
-  #log-box .ln .val { color: var(--accent3); }
 
   footer {
     padding: .6rem 2rem;
@@ -697,13 +678,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-top: 1px solid var(--border);
     display: flex; gap: 2rem;
   }
+
+  @media (max-width: 600px) {
+    .hide-mobile        { display: none; }
+    .subtitle           { display: none; }
+    #status-label       { display: none; }
+    header              { padding: .8rem 1rem; gap: .8rem; }
+    .logo               { font-size: 1.2rem; }
+    .mode-badges        { gap: .4rem; }
+    .badge              { padding: .25rem .5rem; font-size: .65rem; }
+    .kpi-strip          { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
+    .kpi                { padding: .7rem .9rem; }
+    .kpi-value          { font-size: 1.2rem; }
+    .charts-grid        { grid-template-columns: 1fr; }
+    .chart-card         { padding: .8rem .9rem .6rem; }
+    canvas              { height: 80px !important; }
+    footer              { padding: .5rem 1rem; font-size: .6rem; }
+  }
 </style>
 </head>
 <body>
 
 <header>
   <div>
-    <div class="logo">e<span>BUS</span> Monitor</div>
+    <div class="logo">e<span>BUS</span> MON<span class="hide-mobile">ITOR</span></div>
     <div class="subtitle">Heat Pump Live Dashboard</div>
   </div>
   <div class="mode-badges">
@@ -811,7 +809,8 @@ function buildUI() {
               tooltipFormat: 'HH:mm:ss',
             },
             ticks: { color: '#4a6070', font: { family: "'Share Tech Mono'", size: 9 },
-                     maxTicksLimit: 12, maxRotation: 0 },
+                     maxTicksLimit: window.innerWidth <= 600 ? 4 : 12,
+                     maxRotation: 0 },
             grid: { color: '#0f1e2e' }
           },
           y: {
