@@ -933,6 +933,7 @@ function connect() {
       return;
     }
 
+    if (msg.type === 'snapshot' || msg.type === 'update') {
       for (const [key, point] of Object.entries(msg.data || {})) {
         if (key === '_fixes') continue;
         if (point) pushPoint(key, point.ts, point.value);
