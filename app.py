@@ -19,7 +19,7 @@ app = Flask(__name__)
 # ── Configuration ────────────────────────────────────────────────────────────
 EBUSD_HOST     = "127.0.0.1"              # ebusd TCP host
 EBUSD_PORT     = 8888                     # ebusd TCP port
-POLL_INTERVAL  = 5                        # seconds between poll cycles
+POLL_INTERVAL  = 15                       # seconds between poll cycles
 HISTORY_POINTS = 1440                     # one per minute × 24 h = full day in memory
 DATA_DIR       = Path("data")             # where daily .jsonl files are stored
 # TTL passed to async_read: accept cached values up to this many seconds old.
@@ -977,8 +977,7 @@ async function loadHistory() {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 buildUI();
-loadHistory();
-connect();
+loadHistory().then(() => connect());
 </script>
 </body>
 </html>
