@@ -17,7 +17,7 @@ from flask import Flask, Response, render_template_string, jsonify
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-EBUSD_HOST     = "192.168.178.27"              # ebusd TCP host
+EBUSD_HOST     = "127.0.0.1"              # ebusd TCP host
 EBUSD_PORT     = 8888                     # ebusd TCP port
 POLL_INTERVAL  = 5                        # seconds between poll cycles
 HISTORY_POINTS = 1440                     # one per minute × 24 h = full day in memory
@@ -403,6 +403,21 @@ async def _async_poll_loop(ebus, field_map: dict):
             if _current_minute and minute_str != _current_minute:
                 _flush_minute_bucket(_current_minute)
             _current_minute = minute_str
+
+        # ── Midnight rollover ─────────────────────────────────────────────────
+        today_str = now.strftime("%Y-%m-%d")
+        if not hasattr(_async_poll_loop, "_current_day"):
+            _async_poll_loop._current_day = today_str
+        if today_str != _async_poll_loop._current_day:
+            print(f"[persist] midnight rollover → {today_str}")
+            with data_lock:
+                for key in EBUSCTL_FIELDS:
+                    series[key].clear()
+                    _windows[key].clear() if key in _windows else None
+                _minute_bucket.clear()
+            _async_poll_loop._current_day = today_str
+            # Tell the browser to reset all charts to the new day
+            _broadcast(json.dumps({"type": "midnight"}))
 
         if updates:
             with data_lock:
@@ -905,7 +920,19 @@ function connect() {
     const now = new Date().toISOString().replace('T',' ').substring(0,19);
     document.getElementById('last-update').textContent = 'last update: ' + now;
 
-    if (msg.type === 'snapshot' || msg.type === 'update') {
+    if (msg.type === 'midnight') {
+      // New day: clear all chart data and reset x-axis bounds
+      const newStart = new Date(); newStart.setHours(0,0,0,0);
+      const newEnd   = new Date(); newEnd.setHours(23,59,59,999);
+      for (const chart of Object.values(chartMap)) {
+        chart.data.datasets[0].data = [];
+        chart.options.scales.x.min = newStart;
+        chart.options.scales.x.max = newEnd;
+        chart.update('none');
+      }
+      return;
+    }
+
       for (const [key, point] of Object.entries(msg.data || {})) {
         if (key === '_fixes') continue;
         if (point) pushPoint(key, point.ts, point.value);
