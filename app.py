@@ -40,7 +40,6 @@ EBUSCTL_FIELDS = {
     "dhw_temp":          ("HwcTemp",                  "DHW Temp",             "°C"),
     "power_consumption": ("CurrentConsumedPower",     "Power consumption",    "kW"),
     "power_yield":       ("CurrentYieldPower",        "Power yield",          "kW"),
-    "cop":               ("COP",                      "COP",                  ""),
     "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
     "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
     "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
@@ -151,7 +150,6 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "flow":              (  0.0,  3000.0),   # l/h
     "power_consumption": (  0.0,    15.0),   # kW
     "power_yield":       (  0.0,    20.0),   # kW
-    "cop":               (  0.0,    10.0),   # –
     "compressor_speed":  (  0.0,   200.0),   # rps
     "energy_integral":   (-300.0,  50.0),    # ºmin
     "heat_curve":        (  0.0,    5.0),    # dimensionless — typical range 0.2–3.0
@@ -801,6 +799,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 // ── field config (injected from server) ─────────────────────────────────────
 const FIELDS = {{ fields | safe }};
 
+// Client-side derived fields — rendered in UI but never polled from ebusd
+const DERIVED_FIELDS = {
+  "cop": [null, "COP", ""],
+};
+
+// All fields for UI building
+const ALL_FIELDS = { ...FIELDS, ...DERIVED_FIELDS };
+
 // Chart colour palette
 const PALETTE = [
   '#00d4ff','#ff6b35','#39ff14','#f7c59f',
@@ -818,7 +824,7 @@ function buildUI() {
   const grid  = document.getElementById('charts-grid');
   let ci = 0;
 
-  for (const [key, [field, label, unit]] of Object.entries(FIELDS)) {
+  for (const [key, [field, label, unit]] of Object.entries(ALL_FIELDS)) {
     // KPI tile
     const kpi = document.createElement('div');
     kpi.className = 'kpi';
@@ -909,11 +915,15 @@ function fixPoint(key, ts, value) {
   }
 }
 
+// Tracks the latest value per key for derived calculations
+const latestValues = {};
+
 // ── Push a data point into chart + KPI ──────────────────────────────────────
 const GAP_MS = 3 * 60 * 1000;   // gap threshold: 3 minutes
 
 function pushPoint(key, ts, value) {
   if (!(key in chartMap)) return;
+  latestValues[key] = value;
   const chart = chartMap[key];
   const data  = chart.data.datasets[0].data;
   const t     = new Date(ts);
@@ -1060,6 +1070,14 @@ function connect() {
       }
       for (const fix of (msg.data?._fixes || [])) {
         fixPoint(fix.key, fix.ts, fix.value);
+      }
+      // Recalculate COP from incoming power values
+      const consumed = msg.data?.power_consumption?.value;
+      const yielded  = msg.data?.power_yield?.value;
+      const ts       = msg.ts;
+      if (consumed != null && yielded != null && consumed > 0) {
+        const cop = Math.round(((consumed + yielded) / consumed) * 100) / 100;
+        pushPoint('cop', ts, cop);
       }
     }
     if (msg.type === 'log') {
