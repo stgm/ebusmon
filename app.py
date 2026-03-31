@@ -54,9 +54,13 @@ EXTRA_FIELDS = {
     "three_way_valve": "ThreeWayValve",
 }
 
+# Fields that are fed manually (not polled from ebusd)
+MANUAL_FIELDS = {"room_temp"}
+
 # ── Shared state ─────────────────────────────────────────────────────────────
 data_lock    = threading.Lock()
-series: dict[str, deque] = {k: deque(maxlen=HISTORY_POINTS) for k in EBUSCTL_FIELDS}
+series: dict[str, deque] = {k: deque(maxlen=HISTORY_POINTS)
+                             for k in list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS)}
 latest: dict[str, dict]  = {}
 log_lines: deque          = deque(maxlen=200)
 sse_clients: list         = []
@@ -156,6 +160,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "target_room_temp":  ( 10.0,   30.0),    # °C
     "target_hwc_temp":   ( 10.0,   80.0),    # °C
     "flow_pressure":     (  0.0,    5.0),    # bar
+    "room_temp":         ( 10.0,   35.0),    # °C — manual POST input
 }
 
 # Rolling window of the last 5 raw (unfiltered) readings per key
@@ -294,7 +299,7 @@ def _flush_minute_bucket(minute_str: str):
         print(f"[persist] write error: {e}")
 
     # Also push into live series so restored data appears in charts
-    for key in EBUSCTL_FIELDS:
+    for key in list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS):
         if key in record:
             series[key].append({"ts": ts, "value": record[key]})
 
@@ -311,7 +316,7 @@ def restore_today():
     with data_lock:
         for record in records:
             ts = record.get("ts", "")
-            for key in EBUSCTL_FIELDS:
+            for key in list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS):
                 if key in record:
                     series[key].append({"ts": ts, "value": record[key]})
 
@@ -477,7 +482,34 @@ def index():
                                   fields=json.dumps(EBUSCTL_FIELDS))
 
 
-@app.route("/api/dates")
+@app.route("/roomtemp", methods=["POST"])
+def post_roomtemp():
+    raw = request.form.get("current") or request.json and request.json.get("current")
+    if raw is None:
+        return jsonify({"error": "missing 'current' param"}), 400
+    value = parse_value(str(raw))
+    if value is None:
+        return jsonify({"error": "invalid value"}), 400
+
+    lo, hi = BOUNDS.get("room_temp", (-99, 99))
+    if not (lo <= value <= hi):
+        return jsonify({"error": f"value {value} out of bounds [{lo}, {hi}]"}), 400
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    point = {"ts": ts, "value": value}
+    with data_lock:
+        series["room_temp"].append(point)
+        latest["room_temp"] = {"value": value, "unit": "°C",
+                                "label": "Room Temp", "raw": str(raw), "ts": ts}
+        _minute_bucket["room_temp"].append(value)
+
+    print(f"[roomtemp] {ts}: {value} °C")
+    _broadcast(json.dumps({"type": "update", "ts": ts,
+                           "data": {"room_temp": point},
+                           "mode": derive_mode(latest)}))
+    return jsonify({"ok": True, "ts": ts, "value": value})
+
+
 def api_dates():
     """Return sorted list of available day strings (YYYY-MM-DD) from DATA_DIR."""
     if not DATA_DIR.exists():
@@ -508,10 +540,11 @@ def api_history():
                     except json.JSONDecodeError:
                         pass
         # Pivot to per-key series
-        out: dict = {k: [] for k in EBUSCTL_FIELDS}
+        all_keys = list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS)
+        out: dict = {k: [] for k in all_keys}
         for record in records:
             ts = record.get("ts", "")
-            for key in EBUSCTL_FIELDS:
+            for key in all_keys:
                 if key in record:
                     out[key].append({"ts": ts, "value": record[key]})
         out["latest"] = {}
@@ -799,9 +832,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 // ── field config (injected from server) ─────────────────────────────────────
 const FIELDS = {{ fields | safe }};
 
-// Client-side derived fields — rendered in UI but never polled from ebusd
+// Client-side derived fields — rendered in UI but not polled from ebusd
 const DERIVED_FIELDS = {
-  "cop": [null, "COP", ""],
+  "cop":       [null, "COP",       ""],
+  "room_temp": [null, "Room Temp", "°C"],
 };
 
 // All fields for UI building
