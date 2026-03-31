@@ -12,12 +12,12 @@ import atexit
 from datetime import datetime, date
 from collections import deque, defaultdict
 from pathlib import Path
-from flask import Flask, Response, render_template_string, jsonify
+from flask import Flask, Response, render_template_string, jsonify, request
 
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-EBUSD_HOST     = "127.0.0.1"              # ebusd TCP host
+EBUSD_HOST     = "192.168.178.27"              # ebusd TCP host
 EBUSD_PORT     = 8888                     # ebusd TCP port
 POLL_INTERVAL  = 15                       # seconds between poll cycles
 HISTORY_POINTS = 1440                     # one per minute × 24 h = full day in memory
@@ -479,10 +479,50 @@ def index():
                                   fields=json.dumps(EBUSCTL_FIELDS))
 
 
+@app.route("/api/dates")
+def api_dates():
+    """Return sorted list of available day strings (YYYY-MM-DD) from DATA_DIR."""
+    if not DATA_DIR.exists():
+        return jsonify([])
+    days = sorted(
+        p.stem for p in DATA_DIR.glob("*.jsonl")
+        if re.match(r"\d{4}-\d{2}-\d{2}", p.stem)
+    )
+    return jsonify(days)
+
+
 @app.route("/api/history")
 def api_history():
+    req_date = request.args.get("date")  # optional ?date=YYYY-MM-DD
+
+    if req_date and req_date != date.today().isoformat():
+        # Serve a past day directly from its .jsonl file
+        path = DATA_DIR / f"{req_date}.jsonl"
+        records = []
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        # Pivot to per-key series
+        out: dict = {k: [] for k in EBUSCTL_FIELDS}
+        for record in records:
+            ts = record.get("ts", "")
+            for key in EBUSCTL_FIELDS:
+                if key in record:
+                    out[key].append({"ts": ts, "value": record[key]})
+        out["latest"] = {}
+        out["logs"]   = []
+        out["mode"]   = "idle"
+        return jsonify(out)
+
+    # Today: serve live in-memory series
     with data_lock:
-        # series deques already contain today's restored + live points
         out = {k: list(v) for k, v in series.items()}
         out["latest"] = dict(latest)
         out["logs"]   = list(log_lines)
@@ -575,14 +615,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .subtitle { font-size: .8rem; color: var(--muted); font-family: var(--mono); }
   .status-dot {
     width: 10px; height: 10px; border-radius: 50%;
-    background: var(--accent3); margin-left: auto;
+    background: var(--accent3);
     box-shadow: 0 0 8px var(--accent3);
     animation: pulse 2s ease-in-out infinite;
   }
   .status-dot.offline { background: #ff3b3b; box-shadow: 0 0 8px #ff3b3b; animation: none; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-  .status-label { font-family: var(--mono); font-size: .75rem; color: var(--muted); }
+  .header-right {
+    display: flex; align-items: center; gap: .8rem; margin-left: auto;
+  }
+  .date-select {
+    background: #0a1520; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 2px;
+    font-family: var(--mono); font-size: .7rem;
+    padding: .3rem .5rem; cursor: pointer;
+    outline: none;
+  }
+  .date-select:focus { border-color: var(--accent); color: var(--text); }
+  .btn-live {
+    background: var(--accent2); color: #000;
+    border: none; border-radius: 2px;
+    font-family: var(--mono); font-size: .7rem; font-weight: 700;
+    padding: .3rem .7rem; cursor: pointer;
+    letter-spacing: .05em;
+  }
+  .btn-live:hover { opacity: .85; }
 
   /* Mode indicators */
   .mode-badges { display: flex; gap: .6rem; margin-left: auto; align-items: center; }
@@ -687,6 +745,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .logo               { font-size: 1.2rem; }
     .mode-badges        { gap: .4rem; }
     .badge              { padding: .25rem .5rem; font-size: .65rem; }
+    .date-select        { font-size: .65rem; padding: .25rem .4rem; max-width: 90px; }
+    .btn-live           { font-size: .65rem; padding: .25rem .5rem; }
     .kpi-strip          { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
     .kpi                { padding: .7rem .9rem; }
     .kpi-value          { font-size: 1.2rem; }
@@ -714,8 +774,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span>Hot Water</span>
     </div>
   </div>
-  <div class="status-label" id="status-label">connecting…</div>
-  <div class="status-dot offline" id="status-dot"></div>
+  <div class="header-right">
+    <select class="date-select" id="date-select" onchange="onDateChange(this.value)">
+      <option value="">— history —</option>
+    </select>
+    <button class="btn-live" id="btn-live" style="display:none" onclick="returnToLive()">↩ Live</button>
+    <div class="status-dot offline" id="status-dot"></div>
+  </div>
 </header>
 
 <div class="kpi-strip" id="kpi-strip"></div>
@@ -743,9 +808,9 @@ const PALETTE = [
 ];
 
 // ── State ────────────────────────────────────────────────────────────────────
-const chartMap   = {};    // key → Chart.js instance
-const kpiMap     = {};    // key → DOM element
-const seriesData = {};    // key → [{ts,value}]
+const chartMap   = {};
+const kpiMap     = {};
+let   viewingDate = null;   // null = live, 'YYYY-MM-DD' = historical
 
 // ── Build KPI strip & chart grid ─────────────────────────────────────────────
 function buildUI() {
@@ -754,8 +819,6 @@ function buildUI() {
   let ci = 0;
 
   for (const [key, [field, label, unit]] of Object.entries(FIELDS)) {
-    seriesData[key] = [];
-
     // KPI tile
     const kpi = document.createElement('div');
     kpi.className = 'kpi';
@@ -898,20 +961,71 @@ function appendLog(line) {
   while (box.children.length > 200) box.removeChild(box.firstChild);
 }
 
+// ── Date picker ───────────────────────────────────────────────────────────────
+async function populateDatePicker() {
+  try {
+    const r = await fetch('/api/dates');
+    const dates = await r.json();
+    const sel = document.getElementById('date-select');
+    const today = new Date().toISOString().substring(0, 10);
+    for (const d of dates.reverse()) {   // most recent first
+      if (d === today) continue;         // skip today — that's "live"
+      const opt = document.createElement('option');
+      opt.value = d;
+      opt.textContent = d;
+      sel.appendChild(opt);
+    }
+  } catch(e) { console.warn('dates load failed', e); }
+}
+
+function clearCharts(dayStr) {
+  const d    = new Date(dayStr);
+  const start = new Date(d); start.setHours(0,0,0,0);
+  const end   = new Date(d); end.setHours(23,59,59,999);
+  for (const chart of Object.values(chartMap)) {
+    chart.data.datasets[0].data = [];
+    chart.options.scales.x.min = start;
+    chart.options.scales.x.max = end;
+    chart.update('none');
+  }
+}
+
+async function onDateChange(dateStr) {
+  if (!dateStr) return;
+  viewingDate = dateStr;
+  document.getElementById('btn-live').style.display = 'inline-block';
+  document.getElementById('status-dot').style.display = 'none';
+  clearCharts(dateStr);
+  await loadHistory(dateStr);
+}
+
+async function returnToLive() {
+  viewingDate = null;
+  document.getElementById('btn-live').style.display = 'none';
+  document.getElementById('status-dot').style.display = 'block';
+  document.getElementById('date-select').value = '';
+  const today = new Date().toISOString().substring(0, 10);
+  clearCharts(today);
+  // Restore today's axis bounds
+  const start = new Date(); start.setHours(0,0,0,0);
+  const end   = new Date(); end.setHours(23,59,59,999);
+  for (const chart of Object.values(chartMap)) {
+    chart.options.scales.x.min = start;
+    chart.options.scales.x.max = end;
+  }
+  await loadHistory();
+}
+
 // ── SSE connection ────────────────────────────────────────────────────────────
 function connect() {
-  const dot   = document.getElementById('status-dot');
-  const label = document.getElementById('status-label');
   const es = new EventSource('/api/stream');
 
   es.onopen = () => {
-    dot.classList.remove('offline');
-    label.textContent = 'live';
+    document.getElementById('status-dot').classList.remove('offline');
   };
 
   es.onerror = () => {
-    dot.classList.add('offline');
-    label.textContent = 'reconnecting…';
+    document.getElementById('status-dot').classList.add('offline');
   };
 
   es.onmessage = (e) => {
@@ -920,17 +1034,24 @@ function connect() {
     document.getElementById('last-update').textContent = 'last update: ' + now;
 
     if (msg.type === 'midnight') {
-      // New day: clear all chart data and reset x-axis bounds
-      const newStart = new Date(); newStart.setHours(0,0,0,0);
-      const newEnd   = new Date(); newEnd.setHours(23,59,59,999);
-      for (const chart of Object.values(chartMap)) {
-        chart.data.datasets[0].data = [];
-        chart.options.scales.x.min = newStart;
-        chart.options.scales.x.max = newEnd;
-        chart.update('none');
+      if (!viewingDate) {
+        const newStart = new Date(); newStart.setHours(0,0,0,0);
+        const newEnd   = new Date(); newEnd.setHours(23,59,59,999);
+        for (const chart of Object.values(chartMap)) {
+          chart.data.datasets[0].data = [];
+          chart.options.scales.x.min = newStart;
+          chart.options.scales.x.max = newEnd;
+          chart.update('none');
+        }
       }
       return;
     }
+
+    // Always update mode badges regardless of viewing mode
+    if (msg.mode) updateMode(msg.mode);
+
+    // Only push chart data when viewing live
+    if (viewingDate) return;
 
     if (msg.type === 'snapshot' || msg.type === 'update') {
       for (const [key, point] of Object.entries(msg.data || {})) {
@@ -940,7 +1061,6 @@ function connect() {
       for (const fix of (msg.data?._fixes || [])) {
         fixPoint(fix.key, fix.ts, fix.value);
       }
-      if (msg.mode) updateMode(msg.mode);
     }
     if (msg.type === 'log') {
       appendLog(msg.line);
@@ -949,9 +1069,10 @@ function connect() {
 }
 
 // ── Load history on start ─────────────────────────────────────────────────────
-async function loadHistory() {
+async function loadHistory(dateStr) {
   try {
-    const r = await fetch('/api/history');
+    const url = dateStr ? `/api/history?date=${dateStr}` : '/api/history';
+    const r = await fetch(url);
     const h = await r.json();
 
     for (const [key, points] of Object.entries(h)) {
@@ -995,6 +1116,7 @@ async function loadHistory() {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 buildUI();
+populateDatePicker();
 loadHistory().then(() => connect());
 </script>
 </body>
