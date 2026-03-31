@@ -956,7 +956,26 @@ async function loadHistory() {
 
     for (const [key, points] of Object.entries(h)) {
       if (key === 'latest' || key === 'logs' || key === 'mode' || !Array.isArray(points)) continue;
-      points.forEach(p => pushPoint(key, p.ts, p.value));
+      if (!(key in chartMap)) continue;
+      const chart = chartMap[key];
+      const data  = chart.data.datasets[0].data;
+
+      for (const p of points) {
+        const t = new Date(p.ts);
+        if (data.length > 0) {
+          const prevT = data[data.length - 1].x;
+          if (prevT && (t - prevT) > GAP_MS) {
+            data.push({ x: new Date(prevT.getTime() + 1), y: null });
+            data.push({ x: new Date(t.getTime()    - 1), y: null });
+          }
+        }
+        data.push({ x: t, y: p.value });
+      }
+    }
+
+    // Update all charts once after all data is loaded
+    for (const chart of Object.values(chartMap)) {
+      chart.update('none');
     }
 
     (h.logs || []).forEach(appendLog);
