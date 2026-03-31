@@ -17,7 +17,7 @@ from flask import Flask, Response, render_template_string, jsonify, request
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-EBUSD_HOST     = "192.168.178.27"              # ebusd TCP host
+EBUSD_HOST     = "127.0.0.1"              # ebusd TCP host
 EBUSD_PORT     = 8888                     # ebusd TCP port
 POLL_INTERVAL  = 15                       # seconds between poll cycles
 HISTORY_POINTS = 1440                     # one per minute × 24 h = full day in memory
@@ -767,11 +767,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="mode-badges">
     <div class="badge" id="badge-heating">
       <div class="badge-dot"></div>
-      <span>Heating</span>
+      <span>Heat</span>
     </div>
     <div class="badge" id="badge-dhw">
       <div class="badge-dot"></div>
-      <span>Hot Water</span>
+      <span>Tank</span>
     </div>
   </div>
   <div class="header-right">
