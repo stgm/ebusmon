@@ -487,7 +487,8 @@ def post_roomtemp():
     raw = request.form.get("current") or request.json and request.json.get("current")
     if raw is None:
         return jsonify({"error": "missing 'current' param"}), 400
-    value = parse_value(str(raw))
+    # Normalise comma decimal separator (e.g. "20,5" → "20.5")
+    value = parse_value(str(raw).replace(',', '.'))
     if value is None:
         return jsonify({"error": "invalid value"}), 400
 
