@@ -510,6 +510,7 @@ def post_roomtemp():
     return jsonify({"ok": True, "ts": ts, "value": value})
 
 
+@app.route("/api/dates")
 def api_dates():
     """Return sorted list of available day strings (YYYY-MM-DD) from DATA_DIR."""
     if not DATA_DIR.exists():
@@ -1109,11 +1110,11 @@ function connect() {
       for (const fix of (msg.data?._fixes || [])) {
         fixPoint(fix.key, fix.ts, fix.value);
       }
-      // Recalculate COP from incoming power values
+      // Recalculate COP from incoming power values (update only — snapshot has no ts)
       const consumed = msg.data?.power_consumption?.value;
       const yielded  = msg.data?.power_yield?.value;
-      const ts       = msg.ts;
-      if (consumed != null && yielded != null && consumed > 0) {
+      const ts       = msg.ts || msg.data?.power_consumption?.ts;
+      if (ts && consumed != null && yielded != null && consumed > 0) {
         const cop = Math.round(((consumed + yielded) / consumed) * 100) / 100;
         pushPoint('cop', ts, cop);
       }
