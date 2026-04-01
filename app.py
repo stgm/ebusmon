@@ -894,7 +894,7 @@ function buildUI() {
           pointRadius: 0,
           tension: 0.3,
           fill: true,
-          spanGaps: false,   // break line where data is missing
+          spanGaps: 10 * 60 * 1000,   // span gaps up to 10 min; longer = real outage
         }]
       },
       options: {
@@ -956,8 +956,6 @@ function fixPoint(key, ts, value) {
 const latestValues = {};
 
 // ── Push a data point into chart + KPI ──────────────────────────────────────
-const GAP_MS = 3 * 60 * 1000;   // gap threshold: 3 minutes
-
 function pushPoint(key, ts, value) {
   if (!(key in chartMap)) return;
   latestValues[key] = value;
@@ -966,15 +964,6 @@ function pushPoint(key, ts, value) {
   // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
   // UTC by browsers, but we store local timestamps — space forces local parsing.
   const t     = new Date(ts.replace('T', ' '));
-
-  // If the previous point is more than GAP_MS ago, bracket the gap with nulls
-  if (data.length > 0) {
-    const prevT = data[data.length - 1].x;
-    if (prevT && (t - prevT) > GAP_MS) {
-      data.push({ x: new Date(prevT.getTime() + 1), y: null });
-      data.push({ x: new Date(t.getTime()    - 1), y: null });
-    }
-  }
 
   data.push({ x: t, y: value });
   chart.update('none');
@@ -1140,15 +1129,8 @@ async function loadHistory(dateStr) {
 
       for (const p of points) {
         // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
-      // UTC by browsers, but we store local timestamps — space forces local parsing.
-      const t = new Date(p.ts.replace('T', ' '));
-        if (data.length > 0) {
-          const prevT = data[data.length - 1].x;
-          if (prevT && (t - prevT) > GAP_MS) {
-            data.push({ x: new Date(prevT.getTime() + 1), y: null });
-            data.push({ x: new Date(t.getTime()    - 1), y: null });
-          }
-        }
+        // UTC by browsers, but we store local timestamps — space forces local parsing.
+        const t = new Date(p.ts.replace('T', ' '));
         data.push({ x: t, y: p.value });
       }
     }
