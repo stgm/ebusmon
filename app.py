@@ -168,20 +168,12 @@ _WINDOW  = 5
 _windows: dict[str, deque] = {k: deque(maxlen=_WINDOW) for k in BOUNDS}
 
 
-def _patch_series(series_deque: deque, ts: str, value: float):
-    """Overwrite the most recent entry with matching ts in series_deque."""
-    for i in range(len(series_deque) - 1, -1, -1):
-        if series_deque[i]["ts"] == ts:
-            series_deque[i] = {**series_deque[i], "value": value}
-            return
-
-
 def _in_bounds(key: str, value: float) -> bool:
     lo, hi = BOUNDS[key]
     return lo <= value <= hi
 
 
-def check_and_correct(key: str, series_deque: deque) -> list[dict]:
+def check_and_correct(key: str) -> list[dict]:
     """
     Called after a new raw point has been appended to _windows[key].
 
@@ -216,28 +208,25 @@ def check_and_correct(key: str, series_deque: deque) -> list[dict]:
         if run_len <= 2 and i > 0 and run_end < n:
             left_val  = win[i - 1]["value"]
             right_val = win[run_end]["value"]
-            steps     = run_len + 1   # intervals between left anchor and right anchor
+            steps     = run_len + 1
 
             for offset in range(run_len):
-                pt    = win[i + offset]
+                pt     = win[i + offset]
                 interp = round(left_val + (right_val - left_val) * (offset + 1) / steps, 3)
                 print(f"[bounds] {key}: {pt['value']} out of {BOUNDS[key]}, "
                       f"corrected → {interp}")
-                # Patch the window snapshot and the live series deque
                 win[i + offset] = {**pt, "value": interp}
-                _patch_series(series_deque, pt["ts"], interp)
                 corrections.append({"ts": pt["ts"], "value": interp})
 
             # Write corrected values back into the real deque-based window
             real_win = _windows[key]
             for offset in range(run_len):
                 idx_from_end = n - (i + offset) - 1
-                # deque doesn't support negative-index assignment; use rotation
                 real_win.rotate(idx_from_end + 1)
                 real_win[0] = win[i + offset]
                 real_win.rotate(-(idx_from_end + 1))
 
-        i = run_end   # skip past the run (corrected or too long)
+        i = run_end
 
     return corrections
 
@@ -365,14 +354,13 @@ async def _async_poll_loop(ebus, field_map: dict):
 
             point = {"ts": ts, "value": value}
             with data_lock:
-                series[key].append(point)
                 latest[key] = {"value": value, "unit": unit, "label": label,
                                 "raw": str(raw_val), "ts": ts}
                 _minute_bucket[key].append(value)
 
                 if key in _windows:
                     _windows[key].append(point)
-                    corrections = check_and_correct(key, series[key])
+                    corrections = check_and_correct(key)
                     for correction in corrections:
                         updates.setdefault("_fixes", []).append({**correction, "key": key})
                     for correction in corrections:
@@ -499,7 +487,6 @@ def post_roomtemp():
     ts = datetime.now().isoformat(timespec="seconds")
     point = {"ts": ts, "value": value}
     with data_lock:
-        series["room_temp"].append(point)
         latest["room_temp"] = {"value": value, "unit": "°C",
                                 "label": "Room Temp", "raw": str(raw), "ts": ts}
         _minute_bucket["room_temp"].append(value)
