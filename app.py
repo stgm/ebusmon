@@ -938,7 +938,9 @@ function updateMode(mode) {
 function fixPoint(key, ts, value) {
   const chart = chartMap[key];
   if (!chart) return;
-  const t = new Date(ts).getTime();
+  // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
+  // UTC by browsers, but we store local timestamps — space forces local parsing.
+  const t = new Date(ts.replace('T', ' ')).getTime();
   const data = chart.data.datasets[0].data;
   for (let i = data.length - 1; i >= 0; i--) {
     if (data[i].x.getTime() === t) {
@@ -960,7 +962,9 @@ function pushPoint(key, ts, value) {
   latestValues[key] = value;
   const chart = chartMap[key];
   const data  = chart.data.datasets[0].data;
-  const t     = new Date(ts);
+  // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
+  // UTC by browsers, but we store local timestamps — space forces local parsing.
+  const t     = new Date(ts.replace('T', ' '));
 
   // If the previous point is more than GAP_MS ago, bracket the gap with nulls
   if (data.length > 0) {
@@ -1134,7 +1138,9 @@ async function loadHistory(dateStr) {
       const data  = chart.data.datasets[0].data;
 
       for (const p of points) {
-        const t = new Date(p.ts);
+        // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
+      // UTC by browsers, but we store local timestamps — space forces local parsing.
+      const t = new Date(p.ts.replace('T', ' '));
         if (data.length > 0) {
           const prevT = data[data.length - 1].x;
           if (prevT && (t - prevT) > GAP_MS) {
