@@ -31,21 +31,22 @@ READ_TTL       = POLL_INTERVAL * 2
 # Format: { "key": ("ebusd_field_name", "display_label", "unit") }
 # The field name is matched against msgdef.name (case-insensitive).
 EBUSCTL_FIELDS = {
-    "flow":              ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
+    "target_room_temp":  ("TargetTempHc",             "Target room temp",     "ºC"),
+    "target_hwc_temp":   ("TargetTempHwc",            "Target DHW temp",      "ºC"),
+    "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
+    "fan_speed":		 ("RunDataFan1Speed",         "Fan speed",            "rpm"),
+    "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
     "flow_temp":         ("FlowTemp",                 "Flow Temp",            "°C"),
     "target_flow_temp":  ("TargetFlowTemp",           "Target Flow Temp",     "°C"),
-    "return_temp":       ("RunDataReturnTemp",         "Return Temp",          "°C"),
+    "return_temp":       ("RunDataReturnTemp",        "Return Temp",          "°C"),
     "outside_temp":      ("OutdoorTemp",              "Outside Temp",         "°C"),
     "air_intake_temp":   ("AirIntakeTemp",            "Temp on back of pump", "°C"),
     "dhw_temp":          ("HwcTemp",                  "DHW Temp",             "°C"),
+    "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
+    "flow":              ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
+    "flow_pressure":     ("FlowPressure",             "Flow pressure",        "bar"),
     "power_consumption": ("CurrentConsumedPower",     "Power consumption",    "kW"),
     "power_yield":       ("CurrentYieldPower",        "Power yield",          "kW"),
-    "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
-    "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
-    "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
-    "target_room_temp":  ("TargetTempHc",             "Target room temp",     "ºC"),
-    "target_hwc_temp":   ("TargetTempHwc",            "Target DHW temp",      "ºC"),
-    "flow_pressure":     ("FlowPressure",             "Flow pressure",        "bar"),
 }
 
 # Extra fields for mode indicators only (not charted).
