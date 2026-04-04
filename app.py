@@ -1213,6 +1213,28 @@ async function loadHistory(dateStr) {
       chart.update('none');
     }
 
+    // Derive COP from historical power data — join by timestamp
+    const copChart = chartMap[keyToChart['cop']];
+    if (copChart) {
+      const consumed = Object.fromEntries(
+        (h['power_consumption'] || []).map(p => [p.ts, p.value])
+      );
+      const yielded = Object.fromEntries(
+        (h['power_yield'] || []).map(p => [p.ts, p.value])
+      );
+      const copData = copChart.data.datasets[keyToChart['cop'] === 'cop' ? 0 : 1].data;
+      for (const ts of Object.keys(consumed)) {
+        const c = consumed[ts], y = yielded[ts];
+        if (c != null && y != null && c > 0) {
+          const cop = Math.round(((c + y) / c) * 100) / 100;
+          copData.push({ x: new Date(ts.replace('T', ' ')), y: cop });
+        }
+      }
+      // Sort by time since joined keys may be unordered
+      copData.sort((a, b) => a.x - b.x);
+      copChart.update('none');
+    }
+
     (h.logs || []).forEach(appendLog);
     if (h.mode) updateMode(h.mode);
 
