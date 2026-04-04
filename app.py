@@ -31,22 +31,21 @@ READ_TTL       = POLL_INTERVAL * 2
 # Format: { "key": ("ebusd_field_name", "display_label", "unit") }
 # The field name is matched against msgdef.name (case-insensitive).
 EBUSCTL_FIELDS = {
-    "target_room_temp":  ("TargetTempHc",             "Target room temp",     "ºC"),
-    "target_hwc_temp":   ("TargetTempHwc",            "Target DHW temp",      "ºC"),
-    "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
-    "fan_speed":		 ("RunDataFan1Speed",         "Fan speed",            "rpm"),
-    "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
+    "flow":              ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
     "flow_temp":         ("FlowTemp",                 "Flow Temp",            "°C"),
     "target_flow_temp":  ("TargetFlowTemp",           "Target Flow Temp",     "°C"),
-    "return_temp":       ("RunDataReturnTemp",        "Return Temp",          "°C"),
+    "return_temp":       ("RunDataReturnTemp",         "Return Temp",          "°C"),
     "outside_temp":      ("OutdoorTemp",              "Outside Temp",         "°C"),
     "air_intake_temp":   ("AirIntakeTemp",            "Temp on back of pump", "°C"),
     "dhw_temp":          ("HwcTemp",                  "DHW Temp",             "°C"),
-    "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
-    "flow":              ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
-    "flow_pressure":     ("FlowPressure",             "Flow pressure",        "bar"),
     "power_consumption": ("CurrentConsumedPower",     "Power consumption",    "kW"),
     "power_yield":       ("CurrentYieldPower",        "Power yield",          "kW"),
+    "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
+    "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
+    "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
+    "target_room_temp":  ("TargetTempHc",             "Target room temp",     "ºC"),
+    "target_hwc_temp":   ("TargetTempHwc",            "Target DHW temp",      "ºC"),
+    "flow_pressure":     ("FlowPressure",             "Flow pressure",        "bar"),
 }
 
 # Extra fields for mode indicators only (not charted).
@@ -834,13 +833,36 @@ const ALL_FIELDS = { ...FIELDS, ...DERIVED_FIELDS };
 // Chart colour palette
 const PALETTE = [
   '#00d4ff','#ff6b35','#39ff14','#f7c59f',
-  '#b388ff','#4dd0e1','#ffb300','#e91e63'
+  '#b388ff','#4dd0e1','#ffb300','#e91e63',
+  '#ff3b3b','#a0e0ff','#ffe066','#b0ffb0'
+];
+
+// Combined chart definitions — pairs share one chart card and one KPI tile.
+// Format: [ [primary_key, secondary_key], ... ] or just "key" for solo.
+// The label/unit come from ALL_FIELDS for primary; secondary shown smaller.
+const COMBINED_CHARTS = [
+  ["flow"],
+  ["flow_temp"],
+  ["target_flow_temp"],
+  ["return_temp"],
+  ["outside_temp",      "air_intake_temp"],
+  ["dhw_temp",          "target_hwc_temp"],
+  ["power_consumption"],
+  ["power_yield"],
+  ["cop"],
+  ["compressor_speed"],
+  ["energy_integral"],
+  ["heat_curve"],
+  ["target_room_temp"],
+  ["flow_pressure"],
+  ["room_temp",         "target_room_temp"],
 ];
 
 // ── State ────────────────────────────────────────────────────────────────────
-const chartMap   = {};
-const kpiMap     = {};
-let   viewingDate = null;   // null = live, 'YYYY-MM-DD' = historical
+const chartMap   = {};   // primary_key → Chart.js instance
+const kpiMap     = {};   // key → {el, secEl} for KPI values
+const keyToChart = {};   // any key → primary_key (for pushPoint lookup)
+let   viewingDate = null;
 
 // ── Build KPI strip & chart grid ─────────────────────────────────────────────
 function buildUI() {
@@ -848,62 +870,115 @@ function buildUI() {
   const grid  = document.getElementById('charts-grid');
   let ci = 0;
 
-  for (const [key, [field, label, unit]] of Object.entries(ALL_FIELDS)) {
-    // KPI tile
+  // Deduplicate: skip combined secondary keys that appear solo elsewhere
+  // We want room_temp+target_room_temp combined, so remove solo target_room_temp
+  const combinedSecondaries = new Set(
+    COMBINED_CHARTS.filter(g => g.length > 1).map(g => g[1])
+  );
+
+  for (const group of COMBINED_CHARTS) {
+    const primaryKey = group[0];
+    const secondaryKey = group[1] || null;
+
+    // Skip solo entries for keys that are already a secondary in a combined chart
+    if (group.length === 1 && combinedSecondaries.has(primaryKey)) continue;
+
+    const [, primaryLabel, primaryUnit] = ALL_FIELDS[primaryKey] || [null, primaryKey, ''];
+    const secondaryInfo = secondaryKey ? ALL_FIELDS[secondaryKey] : null;
+    const [, secLabel, secUnit] = secondaryInfo || [null, '', ''];
+
+    const color1 = PALETTE[ci++ % PALETTE.length];
+    const color2 = secondaryKey ? PALETTE[ci++ % PALETTE.length] : null;
+
+    // ── KPI tile ──────────────────────────────────────────────────────────────
     const kpi = document.createElement('div');
     kpi.className = 'kpi';
-    kpi.innerHTML = `<div class="kpi-label">${label}</div>
-      <span class="kpi-value" id="kpi-${key}">—</span>
-      <span class="kpi-unit">${unit}</span>`;
+    if (secondaryKey) {
+      kpi.innerHTML = `
+        <div class="kpi-label">${primaryLabel} <span style="opacity:.5">/ ${secLabel}</span></div>
+        <div style="display:flex;align-items:baseline;gap:.4rem">
+          <span class="kpi-value" id="kpi-${primaryKey}" style="color:${color1}">—</span>
+          <span class="kpi-unit">${primaryUnit}</span>
+          <span style="color:var(--muted);font-size:.8rem;margin-left:.2rem">
+            / <span id="kpi-${secondaryKey}" style="color:${color2};font-family:var(--mono);font-size:1rem">—</span>
+            <span style="font-size:.65rem">${secUnit}</span>
+          </span>
+        </div>`;
+    } else {
+      kpi.innerHTML = `
+        <div class="kpi-label">${primaryLabel}</div>
+        <span class="kpi-value" id="kpi-${primaryKey}">—</span>
+        <span class="kpi-unit">${primaryUnit}</span>`;
+    }
     strip.appendChild(kpi);
-    kpiMap[key] = kpi.querySelector(`#kpi-${key}`);
+    kpiMap[primaryKey] = kpi.querySelector(`#kpi-${primaryKey}`);
+    if (secondaryKey) kpiMap[secondaryKey] = kpi.querySelector(`#kpi-${secondaryKey}`);
 
-    // Chart card
+    // ── Chart card ────────────────────────────────────────────────────────────
     const card = document.createElement('div');
     card.className = 'chart-card';
-    card.innerHTML = `<div class="chart-title">${label}${unit ? ' ('+unit+')' : ''}</div>
-      <canvas id="chart-${key}" height="120"></canvas>`;
+    const chartTitle = secondaryKey
+      ? `${primaryLabel} <span style="opacity:.5">/ ${secLabel}</span>${primaryUnit ? ' (' + primaryUnit + ')' : ''}`
+      : `${primaryLabel}${primaryUnit ? ' (' + primaryUnit + ')' : ''}`;
+    card.innerHTML = `<div class="chart-title">${chartTitle}</div>
+      <canvas id="chart-${primaryKey}" height="120"></canvas>`;
     grid.appendChild(card);
 
-    const ctx = card.querySelector(`#chart-${key}`).getContext('2d');
-    const color = PALETTE[ci++ % PALETTE.length];
-
-    // Full-day time bounds — recalculated at midnight if the page stays open
+    const ctx = card.querySelector(`#chart-${primaryKey}`).getContext('2d');
     const dayStart = new Date(); dayStart.setHours(0,0,0,0);
     const dayEnd   = new Date(); dayEnd.setHours(23,59,59,999);
 
-    chartMap[key] = new Chart(ctx, {
+    const datasets = [{
+      data: [],
+      borderColor: color1,
+      backgroundColor: color1 + '18',
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.3,
+      fill: true,
+      spanGaps: 10 * 60 * 1000,
+      label: primaryLabel,
+    }];
+
+    if (secondaryKey) {
+      datasets.push({
+        data: [],
+        borderColor: color2,
+        backgroundColor: 'transparent',
+        borderWidth: 1.5,
+        borderDash: [4, 3],
+        pointRadius: 0,
+        tension: 0.3,
+        fill: false,
+        spanGaps: 10 * 60 * 1000,
+        label: secLabel,
+      });
+    }
+
+    chartMap[primaryKey] = new Chart(ctx, {
       type: 'line',
-      data: {
-        datasets: [{
-          data: [],          // {x: Date, y: value} objects
-          borderColor: color,
-          backgroundColor: color + '18',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
-          fill: true,
-          spanGaps: 10 * 60 * 1000,   // span gaps up to 10 min; longer = real outage
-        }]
-      },
+      data: { datasets },
       options: {
         animation: false,
         responsive: true,
         maintainAspectRatio: true,
-        plugins: { legend: { display: false } },
+        plugins: {
+          legend: {
+            display: !!secondaryKey,
+            labels: {
+              color: '#4a6070',
+              font: { family: "'Share Tech Mono'", size: 9 },
+              boxWidth: 20, boxHeight: 1,
+            }
+          }
+        },
         scales: {
           x: {
             type: 'time',
-            min: dayStart,
-            max: dayEnd,
-            time: {
-              unit: 'hour',
-              displayFormats: { hour: 'HH:mm' },
-              tooltipFormat: 'HH:mm:ss',
-            },
+            min: dayStart, max: dayEnd,
+            time: { unit: 'hour', displayFormats: { hour: 'HH:mm' }, tooltipFormat: 'HH:mm:ss' },
             ticks: { color: '#4a6070', font: { family: "'Share Tech Mono'", size: 9 },
-                     maxTicksLimit: window.innerWidth <= 600 ? 4 : 12,
-                     maxRotation: 0 },
+                     maxTicksLimit: window.innerWidth <= 600 ? 4 : 12, maxRotation: 0 },
             grid: { color: '#0f1e2e' }
           },
           y: {
@@ -913,6 +988,10 @@ function buildUI() {
         }
       }
     });
+
+    // Register key → chart mappings
+    keyToChart[primaryKey] = primaryKey;
+    if (secondaryKey) keyToChart[secondaryKey] = primaryKey;
   }
 }
 
@@ -926,12 +1005,14 @@ function updateMode(mode) {
 
 // ── Retroactively patch an out-of-bounds point in the chart ──────────────────
 function fixPoint(key, ts, value) {
-  const chart = chartMap[key];
+  const primaryKey = keyToChart[key];
+  const chart = chartMap[primaryKey];
   if (!chart) return;
+  const dsIdx = primaryKey === key ? 0 : 1;
   // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
   // UTC by browsers, but we store local timestamps — space forces local parsing.
   const t = new Date(ts.replace('T', ' ')).getTime();
-  const data = chart.data.datasets[0].data;
+  const data = chart.data.datasets[dsIdx].data;
   for (let i = data.length - 1; i >= 0; i--) {
     if (data[i].x.getTime() === t) {
       data[i] = { x: data[i].x, y: value };
@@ -946,18 +1027,18 @@ const latestValues = {};
 
 // ── Push a data point into chart + KPI ──────────────────────────────────────
 function pushPoint(key, ts, value) {
-  if (!(key in chartMap)) return;
+  const primaryKey = keyToChart[key];
+  const chart = chartMap[primaryKey];
+  if (!chart) return;
   latestValues[key] = value;
-  const chart = chartMap[key];
-  const data  = chart.data.datasets[0].data;
+  const dsIdx = primaryKey === key ? 0 : 1;
   // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
   // UTC by browsers, but we store local timestamps — space forces local parsing.
-  const t     = new Date(ts.replace('T', ' '));
-
-  data.push({ x: t, y: value });
+  const t = new Date(ts.replace('T', ' '));
+  chart.data.datasets[dsIdx].data.push({ x: t, y: value });
   chart.update('none');
 
-  // update KPI
+  // Update KPI
   const el = kpiMap[key];
   if (el) {
     el.textContent = Number.isInteger(value) ? value : value.toFixed(1);
@@ -1010,7 +1091,7 @@ function clearCharts(dayStr) {
   const start = new Date(d); start.setHours(0,0,0,0);
   const end   = new Date(d); end.setHours(23,59,59,999);
   for (const chart of Object.values(chartMap)) {
-    chart.data.datasets[0].data = [];
+    chart.data.datasets.forEach(ds => ds.data = []);
     chart.options.scales.x.min = start;
     chart.options.scales.x.max = end;
     chart.update('none');
@@ -1065,7 +1146,7 @@ function connect() {
         const newStart = new Date(); newStart.setHours(0,0,0,0);
         const newEnd   = new Date(); newEnd.setHours(23,59,59,999);
         for (const chart of Object.values(chartMap)) {
-          chart.data.datasets[0].data = [];
+          chart.data.datasets.forEach(ds => ds.data = []);
           chart.options.scales.x.min = newStart;
           chart.options.scales.x.max = newEnd;
           chart.update('none');
@@ -1112,9 +1193,12 @@ async function loadHistory(dateStr) {
 
     for (const [key, points] of Object.entries(h)) {
       if (key === 'latest' || key === 'logs' || key === 'mode' || !Array.isArray(points)) continue;
-      if (!(key in chartMap)) continue;
-      const chart = chartMap[key];
-      const data  = chart.data.datasets[0].data;
+      const primaryKey = keyToChart[key];
+      if (!primaryKey) continue;
+      const chart = chartMap[primaryKey];
+      if (!chart) continue;
+      const dsIdx = primaryKey === key ? 0 : 1;
+      const data  = chart.data.datasets[dsIdx].data;
 
       for (const p of points) {
         // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
