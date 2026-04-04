@@ -838,15 +838,15 @@ const PALETTE = [
 ];
 
 // Combined chart definitions — pairs share one chart card and one KPI tile.
-// Format: [ [primary_key, secondary_key], ... ] or just "key" for solo.
-// The label/unit come from ALL_FIELDS for primary; secondary shown smaller.
+// Format: [ [primary_key, secondary_key, optional_short_secondary_label], ... ]
 const COMBINED_CHARTS = [
+  ["room_temp",         "target_room_temp", "Target"],
+  ["dhw_temp",          "target_hwc_temp",  "Target"],
   ["flow"],
   ["flow_temp"],
   ["target_flow_temp"],
   ["return_temp"],
-  ["outside_temp",      "air_intake_temp"],
-  ["dhw_temp",          "target_hwc_temp"],
+  ["outside_temp",      "air_intake_temp",  "Pump"],
   ["power_consumption"],
   ["power_yield"],
   ["cop"],
@@ -855,7 +855,6 @@ const COMBINED_CHARTS = [
   ["heat_curve"],
   ["target_room_temp"],
   ["flow_pressure"],
-  ["room_temp",         "target_room_temp"],
 ];
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -877,15 +876,17 @@ function buildUI() {
   );
 
   for (const group of COMBINED_CHARTS) {
-    const primaryKey = group[0];
+    const primaryKey   = group[0];
     const secondaryKey = group[1] || null;
+    const shortSecLabel = group[2] || null;   // optional short label override
 
     // Skip solo entries for keys that are already a secondary in a combined chart
     if (group.length === 1 && combinedSecondaries.has(primaryKey)) continue;
 
     const [, primaryLabel, primaryUnit] = ALL_FIELDS[primaryKey] || [null, primaryKey, ''];
     const secondaryInfo = secondaryKey ? ALL_FIELDS[secondaryKey] : null;
-    const [, secLabel, secUnit] = secondaryInfo || [null, '', ''];
+    const [, secLabelFull] = secondaryInfo || [null, ''];
+    const secLabel = shortSecLabel || secLabelFull;
 
     const color1 = PALETTE[ci++ % PALETTE.length];
     const color2 = secondaryKey ? PALETTE[ci++ % PALETTE.length] : null;
@@ -897,12 +898,11 @@ function buildUI() {
       kpi.innerHTML = `
         <div class="kpi-label">${primaryLabel} <span style="opacity:.5">/ ${secLabel}</span></div>
         <div style="display:flex;align-items:baseline;gap:.4rem">
-          <span class="kpi-value" id="kpi-${primaryKey}" style="color:${color1}">—</span>
-          <span class="kpi-unit">${primaryUnit}</span>
-          <span style="color:var(--muted);font-size:.8rem;margin-left:.2rem">
-            / <span id="kpi-${secondaryKey}" style="color:${color2};font-family:var(--mono);font-size:1rem">—</span>
-            <span style="font-size:.65rem">${secUnit}</span>
+          <span class="kpi-value" id="kpi-${primaryKey}">—</span>
+          <span style="color:var(--muted);font-size:.8rem;margin-left:.1rem">
+            / <span id="kpi-${secondaryKey}" style="font-family:var(--mono);font-size:1rem;color:var(--accent)">—</span>
           </span>
+          <span class="kpi-unit">${primaryUnit}</span>
         </div>`;
     } else {
       kpi.innerHTML = `
