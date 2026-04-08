@@ -2,6 +2,7 @@
 ebusd Live Dashboard - Flask Backend
 Uses pyebus to communicate directly with ebusd over TCP.
 """
+import argparse
 import asyncio
 import threading
 import time
@@ -9,6 +10,7 @@ import json
 import re
 import os
 import atexit
+import yaml
 from datetime import datetime, date
 from collections import deque, defaultdict
 from pathlib import Path
@@ -17,50 +19,122 @@ from flask import Flask, Response, render_template_string, jsonify, request
 app = Flask(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────────────
-EBUSD_HOST     = "127.0.0.1"              # ebusd TCP host
-EBUSD_PORT     = 8888                     # ebusd TCP port
 POLL_INTERVAL  = 15                       # seconds between poll cycles
 HISTORY_POINTS = 1440                     # one per minute × 24 h = full day in memory
 DATA_DIR       = Path("data")             # where daily .jsonl files are stored
 # TTL passed to async_read: accept cached values up to this many seconds old.
-# ebusd won't go to the bus more often than needed; this just means we accept
-# the cached value rather than forcing a fresh bus read every poll cycle.
 READ_TTL       = POLL_INTERVAL * 2
 
-# Fields to read via pyebus.
-# Format: { "key": ("ebusd_field_name", "display_label", "unit") }
-# The field name is matched against msgdef.name (case-insensitive).
-EBUSCTL_FIELDS = {
-    "flow":              ("BuildingCircuitFlow",      "Circuit Flow",         "l/h"),
-    "flow_temp":         ("FlowTemp",                 "Flow Temp",            "°C"),
-    "target_flow_temp":  ("TargetFlowTemp",           "Target Flow Temp",     "°C"),
-    "return_temp":       ("RunDataReturnTemp",         "Return Temp",          "°C"),
-    "outside_temp":      ("OutdoorTemp",              "Outside Temp",         "°C"),
-    "air_intake_temp":   ("AirIntakeTemp",            "Temp on back of pump", "°C"),
-    "dhw_temp":          ("HwcTemp",                  "DHW Temp",             "°C"),
-    "power_consumption": ("CurrentConsumedPower",     "Power consumption",    "kW"),
-    "power_yield":       ("CurrentYieldPower",        "Power yield",          "kW"),
-    "compressor_speed":  ("RunDataCompressorSpeed",   "Compressor Speed",     "rps"),
-    "energy_integral":   ("EnergyIntegral",           "Energie-integral",     "ºmin"),
-    "heat_curve":        ("HeatCurve",                "Heat curve",           ""),
-    "target_room_temp":  ("TargetTempHc",             "Target room temp",     "ºC"),
-    "target_hwc_temp":   ("TargetTempHwc",            "Target DHW temp",      "ºC"),
-    "flow_pressure":     ("FlowPressure",             "Flow pressure",        "bar"),
-}
 
-# Extra fields for mode indicators only (not charted).
-# Value may be a string (e.g. "warm water circuit") so we store raw.
-EXTRA_FIELDS = {
-    "three_way_valve": "ThreeWayValve",
-}
+def _camel_to_snake(name: str) -> str:
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+    s = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
+    return s.lower()
 
-# Fields that are fed manually (not polled from ebusd)
-MANUAL_FIELDS = {"room_temp"}
+
+def _camel_to_label(name: str) -> str:
+    if name == name.lower():          # already snake_case (e.g. room_temp)
+        words = name.split('_')
+        return ' '.join([words[0].capitalize()] + words[1:]) if words else name
+    s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', name)
+    s = re.sub(r'([a-z\d])([A-Z])', r'\1 \2', s)
+    words = s.split()
+    return ' '.join([words[0].capitalize()] + [w.lower() for w in words[1:]]) if words else name
+
+
+def _load_config(path: str = "config.yaml") -> dict:
+    """Load and parse config.yaml into runtime data structures."""
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+
+    ebusd = cfg.get("ebusd", {})
+    host  = ebusd.get("host", "127.0.0.1")
+    port  = int(ebusd.get("port", 8888))
+
+    # Parse charts: list of {field_name: {bounds, label}} dicts
+    field_groups: list[list[str]] = []
+    bounds:       dict[str, tuple[float, float]] = {}
+    label_overrides: dict[str, str] = {}
+
+    for chart_entry in cfg.get("charts", []):
+        group_names = []
+        for field_name, field_cfg in chart_entry.items():
+            group_names.append(field_name)
+            key = _camel_to_snake(field_name)
+            if field_cfg:
+                if "bounds" in field_cfg:
+                    lo, hi = field_cfg["bounds"]
+                    bounds[key] = (float(lo), float(hi))
+                if "label" in field_cfg:
+                    label_overrides[key] = field_cfg["label"]
+        field_groups.append(group_names)
+
+    # Parse indicators: list of {label: {field: condition}} dicts
+    indicators: list[dict] = []
+    for entry in cfg.get("indicators", []):
+        for label, conditions in entry.items():
+            indicators.append({"label": label, "conditions": dict(conditions)})
+
+    server = cfg.get("server", {})
+
+    return {
+        "host":            host,
+        "port":            port,
+        "server_port":     int(server.get("port", 6789)),
+        "field_groups":    field_groups,
+        "bounds":          bounds,
+        "label_overrides": label_overrides,
+        "indicators":      indicators,
+    }
+
+
+_parser = argparse.ArgumentParser(description="ebusd Live Dashboard")
+_parser.add_argument("--config", "-c", default="config.yaml", metavar="FILE",
+                     help="path to config file (default: config.yaml)")
+_args, _ = _parser.parse_known_args()   # parse_known_args so Flask/uv args don't cause errors
+
+_cfg = _load_config(_args.config)
+
+EBUSD_HOST  = _cfg["host"]
+EBUSD_PORT  = _cfg["port"]
+SERVER_PORT = _cfg["server_port"]
+
+# Flatten groups → deduplicated field dict; units filled from ebusd in _async_main.
+EBUSCTL_FIELDS: dict[str, tuple] = {}
+_seen: set[str] = set()
+for _group in _cfg["field_groups"]:
+    for _name in _group:
+        _key = _camel_to_snake(_name)
+        if _key not in _seen:
+            _seen.add(_key)
+            _label = _cfg["label_overrides"].get(_key) or _camel_to_label(_name)
+            EBUSCTL_FIELDS[_key] = (_name, _label, "")
+del _seen, _group, _name, _key, _label
+
+# Chart groups as snake_case keys for JS injection
+CHART_GROUPS: list[list[str]] = [
+    [_camel_to_snake(n) for n in group]
+    for group in _cfg["field_groups"]
+]
+
+BOUNDS: dict[str, tuple[float, float]] = _cfg["bounds"]
+
+# Indicators: list of {label, conditions} — conditions: {field_name: value_or_"on"}
+INDICATORS: list[dict] = _cfg["indicators"]
+
+# Extra fields referenced by indicators but not charted (value may be a string)
+EXTRA_FIELDS: dict[str, str] = {}
+for _ind in INDICATORS:
+    for _fname in _ind["conditions"]:
+        _key = _camel_to_snake(_fname)
+        if _key not in EBUSCTL_FIELDS and _key not in EXTRA_FIELDS:
+            EXTRA_FIELDS[_key] = _fname
+del _ind, _fname, _key
 
 # ── Shared state ─────────────────────────────────────────────────────────────
 data_lock    = threading.Lock()
 series: dict[str, deque] = {k: deque(maxlen=HISTORY_POINTS)
-                             for k in list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS)}
+                             for k in EBUSCTL_FIELDS}
 latest: dict[str, dict]  = {}
 log_lines: deque          = deque(maxlen=200)
 sse_clients: list         = []
@@ -137,31 +211,8 @@ def parse_value(raw) -> float | None:
 #
 # Any reading outside [lo, hi] is treated as a glitch and replaced with a
 # linear interpolation of its surrounding good neighbours (up to 2 consecutive
-# bad points are handled).
+# bad points are handled). BOUNDS is populated from config.yaml.
 #
-# Values are accepted as-is once they return inside bounds — no rate-of-change
-# logic, no relative thresholds. Bounds are set to realistic physical limits
-# with generous headroom so no legitimate reading is ever rejected.
-#
-BOUNDS: dict[str, tuple[float, float]] = {
-    #                       lo       hi
-    "flow_temp":         ( -5.0,    90.0),   # °C  — freeze to boiling headroom
-    "target_flow_temp":  ( -5.0,    90.0),   # °C
-    "return_temp":       ( -5.0,    80.0),   # °C
-    "outside_temp":      (-30.0,    50.0),   # °C  — realistic NL range + margin
-    "air_intake_temp":   (-30.0,    60.0),   # °C
-    "dhw_temp":          (  5.0,    80.0),   # °C
-    "flow":              (  0.0,  3000.0),   # l/h
-    "power_consumption": (  0.0,    15.0),   # kW
-    "power_yield":       (  0.0,    20.0),   # kW
-    "compressor_speed":  (  0.0,   200.0),   # rps
-    "energy_integral":   (-300.0,  50.0),    # ºmin
-    "heat_curve":        (  0.0,    5.0),    # dimensionless — typical range 0.2–3.0
-    "target_room_temp":  ( 10.0,   30.0),    # °C
-    "target_hwc_temp":   ( 10.0,   80.0),    # °C
-    "flow_pressure":     (  0.0,    5.0),    # bar
-    "room_temp":         ( 10.0,   35.0),    # °C — manual POST input
-}
 
 # Rolling window of the last 5 raw (unfiltered) readings per key
 _WINDOW  = 5
@@ -288,7 +339,7 @@ def _flush_minute_bucket(minute_str: str):
         print(f"[persist] write error: {e}")
 
     # Also push into live series so restored data appears in charts
-    for key in list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS):
+    for key in list(EBUSCTL_FIELDS.keys()):
         if key in record:
             series[key].append({"ts": ts, "value": record[key]})
 
@@ -305,22 +356,33 @@ def restore_today():
     with data_lock:
         for record in records:
             ts = record.get("ts", "")
-            for key in list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS):
+            for key in list(EBUSCTL_FIELDS.keys()):
                 if key in record:
                     series[key].append({"ts": ts, "value": record[key]})
 
 
-def derive_mode(latest_snap: dict) -> str:
-    """Return 'dhw' | 'heating' | 'idle' based on latest values."""
-    compressor = latest_snap.get("compressor_speed", {}).get("value", 0) or 0
-    # ThreeWayValve returns a string like "warm water circuit" or "heating circuit"
-    valve_raw  = str(latest_snap.get("three_way_valve", {}).get("value", "")).lower()
-    valve_dhw  = "warm water" in valve_raw or "dhw" in valve_raw
-    if compressor > 0 and valve_dhw:
-        return "dhw"
-    if compressor > 0:
-        return "heating"
-    return "idle"
+def derive_indicators(latest_snap: dict) -> list[str]:
+    """Return list of active indicator labels based on current field values."""
+    active = []
+    for indicator in INDICATORS:
+        all_met = True
+        for fname, condition in indicator["conditions"].items():
+            key   = _camel_to_snake(fname)
+            value = latest_snap.get(key, {}).get("value")
+            if value is None:
+                all_met = False
+                break
+            if condition == "on" or condition is True:  # YAML may parse bare 'on' as True
+                if not (isinstance(value, (int, float)) and value > 0):
+                    all_met = False
+                    break
+            else:
+                if str(condition).lower() not in str(value).lower():
+                    all_met = False
+                    break
+        if all_met:
+            active.append(indicator["label"])
+    return active
 
 
 async def _async_poll_loop(ebus, field_map: dict):
@@ -412,9 +474,9 @@ async def _async_poll_loop(ebus, field_map: dict):
 
         if updates:
             with data_lock:
-                mode = derive_mode(latest)
+                indicators = derive_indicators(latest)
             _broadcast(json.dumps({"type": "update", "ts": ts,
-                                   "data": updates, "mode": mode}))
+                                   "data": updates, "indicators": indicators}))
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -431,6 +493,14 @@ async def _async_main():
     print(f"[pyebus] loaded {sum(1 for _ in ebus.msgdefs)} message definitions")
     field_map = _build_field_map(ebus)
     print(f"[pyebus] indexed {len(field_map)} fields")
+
+    # Fill in units from ebusd msgdefs
+    for key, (fname, label, _) in EBUSCTL_FIELDS.items():
+        entry = field_map.get(fname.lower())
+        if entry:
+            _, fielddef = entry
+            EBUSCTL_FIELDS[key] = (fname, label, fielddef.unit or "")
+    print(f"[pyebus] units loaded: { {k: v[2] for k, v in EBUSCTL_FIELDS.items()} }")
 
     missing = ({v[0].lower() for v in EBUSCTL_FIELDS.values()} |
                {v.lower() for v in EXTRA_FIELDS.values()}) - set(field_map.keys())
@@ -467,7 +537,9 @@ def _broadcast(payload: str):
 @app.route("/")
 def index():
     return render_template_string(DASHBOARD_HTML,
-                                  fields=json.dumps(EBUSCTL_FIELDS))
+                                  fields=json.dumps(EBUSCTL_FIELDS),
+                                  chart_groups=json.dumps(CHART_GROUPS),
+                                  indicators=INDICATORS)
 
 
 @app.route("/roomtemp", methods=["POST"])
@@ -494,7 +566,7 @@ def post_roomtemp():
     print(f"[roomtemp] {ts}: {value} °C")
     _broadcast(json.dumps({"type": "update", "ts": ts,
                            "data": {"room_temp": point},
-                           "mode": derive_mode(latest)}))
+                           "indicators": derive_indicators(latest)}))
     return jsonify({"ok": True, "ts": ts, "value": value})
 
 
@@ -529,7 +601,7 @@ def api_history():
                     except json.JSONDecodeError:
                         pass
         # Pivot to per-key series
-        all_keys = list(EBUSCTL_FIELDS.keys()) + list(MANUAL_FIELDS)
+        all_keys = list(EBUSCTL_FIELDS.keys())
         out: dict = {k: [] for k in all_keys}
         for record in records:
             ts = record.get("ts", "")
@@ -538,7 +610,7 @@ def api_history():
                     out[key].append({"ts": ts, "value": record[key]})
         out["latest"] = {}
         out["logs"]   = []
-        out["mode"]   = "idle"
+        out["indicators"] = []
         return jsonify(out)
 
     # Today: serve live in-memory series
@@ -546,7 +618,7 @@ def api_history():
         out = {k: list(v) for k, v in series.items()}
         out["latest"] = dict(latest)
         out["logs"]   = list(log_lines)
-        out["mode"]   = derive_mode(latest)
+        out["indicators"] = derive_indicators(latest)
     return jsonify(out)
 
 
@@ -680,26 +752,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     background: var(--muted);
     transition: background .4s, box-shadow .4s;
   }
-  .badge.active-heating {
-    border-color: #ff6b35;
-    color: #ff9a6c;
-    box-shadow: 0 0 10px #ff6b3540;
-  }
-  .badge.active-heating .badge-dot {
-    background: #ff6b35;
-    box-shadow: 0 0 6px #ff6b35;
-    animation: pulse 1.4s ease-in-out infinite;
-  }
-  .badge.active-dhw {
-    border-color: #00d4ff;
-    color: #6ee6ff;
-    box-shadow: 0 0 10px #00d4ff40;
-  }
-  .badge.active-dhw .badge-dot {
-    background: #00d4ff;
-    box-shadow: 0 0 6px #00d4ff;
-    animation: pulse 1.4s ease-in-out infinite;
-  }
+  .badge.active-0 { border-color: #ff6b35; color: #ff9a6c; box-shadow: 0 0 10px #ff6b3540; }
+  .badge.active-0 .badge-dot { background: #ff6b35; box-shadow: 0 0 6px #ff6b35; animation: pulse 1.4s ease-in-out infinite; }
+  .badge.active-1 { border-color: #00d4ff; color: #6ee6ff; box-shadow: 0 0 10px #00d4ff40; }
+  .badge.active-1 .badge-dot { background: #00d4ff; box-shadow: 0 0 6px #00d4ff; animation: pulse 1.4s ease-in-out infinite; }
+  .badge.active-2 { border-color: #39ff14; color: #80ff60; box-shadow: 0 0 10px #39ff1440; }
+  .badge.active-2 .badge-dot { background: #39ff14; box-shadow: 0 0 6px #39ff14; animation: pulse 1.4s ease-in-out infinite; }
 
   /* KPI strip */
   .kpi-strip {
@@ -785,14 +843,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="subtitle">Heat Pump Live Dashboard</div>
   </div>
   <div class="mode-badges">
-    <div class="badge" id="badge-heating">
+    {% for ind in indicators %}
+    <div class="badge" data-indicator="{{ ind.label }}">
       <div class="badge-dot"></div>
-      <span>Heat</span>
+      <span>{{ ind.label }}</span>
     </div>
-    <div class="badge" id="badge-dhw">
-      <div class="badge-dot"></div>
-      <span>Tank</span>
-    </div>
+    {% endfor %}
   </div>
   <div class="header-right">
     <select class="date-select" id="date-select" onchange="onDateChange(this.value)">
@@ -814,17 +870,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <footer>
   <span id="last-update">last update: —</span>
-  <span>poll interval: {{ fields | tojson | length }} fields / {{ 5 }}s</span>
+  <span>poll interval: {{ chart_groups | tojson | length }} charts / {{ 5 }}s</span>
 </footer>
 
 <script>
 // ── field config (injected from server) ─────────────────────────────────────
 const FIELDS = {{ fields | safe }};
 
-// Client-side derived fields — rendered in UI but not polled from ebusd
+// Client-side overrides — room_temp provides unit (not available from ebusd)
 const DERIVED_FIELDS = {
-  "cop":       [null, "COP",       ""],
-  "room_temp": [null, "Room Temp", "°C"],
+  "room_temp": [null, "Room temp","°C"],
 };
 
 // All fields for UI building
@@ -837,25 +892,7 @@ const PALETTE = [
   '#ff3b3b','#a0e0ff','#ffe066','#b0ffb0'
 ];
 
-// Combined chart definitions — pairs share one chart card and one KPI tile.
-// Format: [ [primary_key, secondary_key, optional_short_secondary_label], ... ]
-const COMBINED_CHARTS = [
-  ["room_temp",         "target_room_temp", "Target"],
-  ["dhw_temp",          "target_hwc_temp",  "Target"],
-  ["flow"],
-  ["flow_temp"],
-  ["target_flow_temp"],
-  ["return_temp"],
-  ["outside_temp",      "air_intake_temp",  "Pump"],
-  ["power_consumption"],
-  ["power_yield"],
-  ["cop"],
-  ["compressor_speed"],
-  ["energy_integral"],
-  ["heat_curve"],
-  ["target_room_temp"],
-  ["flow_pressure"],
-];
+const CHART_GROUPS = {{ chart_groups | safe }};
 
 // ── State ────────────────────────────────────────────────────────────────────
 const chartMap   = {};   // primary_key → Chart.js instance
@@ -869,24 +906,14 @@ function buildUI() {
   const grid  = document.getElementById('charts-grid');
   let ci = 0;
 
-  // Deduplicate: skip combined secondary keys that appear solo elsewhere
-  // We want room_temp+target_room_temp combined, so remove solo target_room_temp
-  const combinedSecondaries = new Set(
-    COMBINED_CHARTS.filter(g => g.length > 1).map(g => g[1])
-  );
-
-  for (const group of COMBINED_CHARTS) {
+  for (const group of CHART_GROUPS) {
     const primaryKey   = group[0];
     const secondaryKey = group[1] || null;
-    const shortSecLabel = group[2] || null;   // optional short label override
-
-    // Skip solo entries for keys that are already a secondary in a combined chart
-    if (group.length === 1 && combinedSecondaries.has(primaryKey)) continue;
 
     const [, primaryLabel, primaryUnit] = ALL_FIELDS[primaryKey] || [null, primaryKey, ''];
     const secondaryInfo = secondaryKey ? ALL_FIELDS[secondaryKey] : null;
     const [, secLabelFull] = secondaryInfo || [null, ''];
-    const secLabel = shortSecLabel || secLabelFull;
+    const secLabel = secLabelFull ? secLabelFull.split(' ')[0] : '';
 
     const color1 = PALETTE[ci++ % PALETTE.length];
     const color2 = secondaryKey ? PALETTE[ci++ % PALETTE.length] : null;
@@ -996,11 +1023,10 @@ function buildUI() {
 }
 
 // ── Mode indicators ───────────────────────────────────────────────────────────
-function updateMode(mode) {
-  const bH = document.getElementById('badge-heating');
-  const bD = document.getElementById('badge-dhw');
-  bH.className = 'badge' + (mode === 'heating' ? ' active-heating' : '');
-  bD.className = 'badge' + (mode === 'dhw'     ? ' active-dhw'     : '');
+function updateIndicators(active) {
+  document.querySelectorAll('[data-indicator]').forEach((el, idx) => {
+    el.className = 'badge' + (active.includes(el.dataset.indicator) ? ` active-${idx}` : '');
+  });
 }
 
 // ── Retroactively patch an out-of-bounds point in the chart ──────────────────
@@ -1156,7 +1182,7 @@ function connect() {
     }
 
     // Always update mode badges regardless of viewing mode
-    if (msg.mode) updateMode(msg.mode);
+    if (msg.indicators) updateIndicators(msg.indicators);
 
     // Only push chart data when viewing live
     if (viewingDate) return;
@@ -1168,14 +1194,6 @@ function connect() {
       }
       for (const fix of (msg.data?._fixes || [])) {
         fixPoint(fix.key, fix.ts, fix.value);
-      }
-      // Recalculate COP from incoming power values (update only — snapshot has no ts)
-      const consumed = msg.data?.power_consumption?.value;
-      const yielded  = msg.data?.power_yield?.value;
-      const ts       = msg.ts || msg.data?.power_consumption?.ts;
-      if (ts && consumed != null && yielded != null && consumed > 0) {
-        const cop = Math.round(((consumed + yielded) / consumed) * 100) / 100;
-        pushPoint('cop', ts, cop);
       }
     }
     if (msg.type === 'log') {
@@ -1192,7 +1210,7 @@ async function loadHistory(dateStr) {
     const h = await r.json();
 
     for (const [key, points] of Object.entries(h)) {
-      if (key === 'latest' || key === 'logs' || key === 'mode' || !Array.isArray(points)) continue;
+      if (key === 'latest' || key === 'logs' || key === 'indicators' || !Array.isArray(points)) continue;
       const primaryKey = keyToChart[key];
       if (!primaryKey) continue;
       const chart = chartMap[primaryKey];
@@ -1213,30 +1231,10 @@ async function loadHistory(dateStr) {
       chart.update('none');
     }
 
-    // Derive COP from historical power data — join by timestamp
-    const copChart = chartMap[keyToChart['cop']];
-    if (copChart) {
-      const consumed = Object.fromEntries(
-        (h['power_consumption'] || []).map(p => [p.ts, p.value])
-      );
-      const yielded = Object.fromEntries(
-        (h['power_yield'] || []).map(p => [p.ts, p.value])
-      );
-      const copData = copChart.data.datasets[keyToChart['cop'] === 'cop' ? 0 : 1].data;
-      for (const ts of Object.keys(consumed)) {
-        const c = consumed[ts], y = yielded[ts];
-        if (c != null && y != null && c > 0) {
-          const cop = Math.round(((c + y) / c) * 100) / 100;
-          copData.push({ x: new Date(ts.replace('T', ' ')), y: cop });
-        }
-      }
-      // Sort by time since joined keys may be unordered
-      copData.sort((a, b) => a.x - b.x);
-      copChart.update('none');
-    }
+
 
     (h.logs || []).forEach(appendLog);
-    if (h.mode) updateMode(h.mode);
+    if (h.indicators) updateIndicators(h.indicators);
 
     if (h.latest) {
       for (const [key, meta] of Object.entries(h.latest)) {
@@ -1272,4 +1270,4 @@ atexit.register(_shutdown_flush)
 if __name__ == "__main__":
     restore_today()
     threading.Thread(target=_start_async_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=6789, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=SERVER_PORT, debug=False, threaded=True)

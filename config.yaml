@@ -1,0 +1,62 @@
+ebusd:
+  host: 192.168.178.27
+  port: 8888
+
+server:
+  port: 6789
+
+# Each entry is one chart/KPI tile.
+# First key = primary field, second key (optional) = secondary.
+# All names are CamelCase; internal snake_case keys are derived automatically.
+# label:  override the auto-derived label (optional)
+# bounds: [lo, hi] — values outside this range are treated as glitches (optional)
+charts:
+  - RoomTemp:
+      label: Room temp
+      bounds: [10, 35]
+    TargetTempHc:
+      bounds: [10, 30]
+
+  - HwcTemp:
+      bounds: [5, 80]
+    TargetTempHwc:
+      bounds: [10, 80]
+
+  - BuildingCircuitFlow:
+      bounds: [0, 3000]
+  - FlowTemp:
+      bounds: [-5, 90]
+  - TargetFlowTemp:
+      bounds: [-5, 90]
+  - RunDataReturnTemp:
+      bounds: [-5, 80]
+
+  - OutdoorTemp:
+      bounds: [-30, 50]
+    AirIntakeTemp:
+      bounds: [-30, 60]
+
+  - CurrentConsumedPower:
+      bounds: [0, 15]
+  - CurrentYieldPower:
+      bounds: [0, 20]
+  - RunDataCompressorSpeed:
+      bounds: [0, 200]
+  - EnergyIntegral:
+      bounds: [-300, 50]
+  - HeatCurve:
+      bounds: [0, 5]
+  - FlowPressure:
+      bounds: [0, 5]
+
+# Indicators shown in the header.
+# Conditions are ANDed: string value → field contains that substring (case-insensitive)
+#                       "on"         → numeric field value > 0
+indicators:
+  - Heat:
+      ThreeWayValve: heat
+      RunDataCompressorSpeed: "on"
+
+  - Hot water:
+      ThreeWayValve: warm water
+      RunDataCompressorSpeed: "on"
