@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>eBUS Heat Pump Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">e<span>BUS</span> MON<span class="hide-mobile">ITOR</span></div>
+    <div class="subtitle">Heat Pump Live Dashboard</div>
+  </div>
+  <div class="mode-badges">
+    {% for ind in indicators %}
+    <div class="badge" data-indicator="{{ ind.label }}">
+      <div class="badge-dot"></div>
+      <span>{{ ind.label }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="header-right">
+    <select class="date-select" id="date-select" onchange="onDateChange(this.value)">
+      <option value="">— history —</option>
+    </select>
+    <button class="btn-live" id="btn-live" style="display:none" onclick="returnToLive()">↩ Live</button>
+    <div class="status-dot offline" id="status-dot"></div>
+  </div>
+</header>
+
+<div class="kpi-strip" id="kpi-strip"></div>
+
+<div class="charts-grid" id="charts-grid"></div>
+
+<div class="log-section">
+  <div class="log-header">▸ eBUS traffic log</div>
+  <div id="log-box"></div>
+</div>
+
+<footer>
+  <span id="last-update">last update: —</span>
+  <span>{{ chart_groups | length }} charts</span>
+</footer>
+
+<script>
+// Server-injected config — must come before app.js
+const FIELDS       = {{ fields | safe }};
+const CHART_GROUPS = {{ chart_groups | safe }};
+</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -14,7 +14,7 @@ import yaml
 from datetime import datetime, date
 from collections import deque, defaultdict
 from pathlib import Path
-from flask import Flask, Response, render_template_string, jsonify, request
+from flask import Flask, Response, render_template, jsonify, request
 
 app = Flask(__name__)
 
@@ -51,22 +51,33 @@ def _load_config(path: str = "config.yaml") -> dict:
     host  = ebusd.get("host", "127.0.0.1")
     port  = int(ebusd.get("port", 8888))
 
-    # Parse charts: list of {field_name: {bounds, label}} dicts
+    # Parse charts: list of {label: "FieldName[, log_key][, min, max]"} dicts
     field_groups: list[list[str]] = []
     bounds:       dict[str, tuple[float, float]] = {}
     label_overrides: dict[str, str] = {}
+    log_key_overrides: dict[str, str] = {}
+
+    def _is_number(s: str) -> bool:
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
 
     for chart_entry in cfg.get("charts", []):
         group_names = []
-        for field_name, field_cfg in chart_entry.items():
-            group_names.append(field_name)
+        for label, value in chart_entry.items():
+            parts = [p.strip() for p in str(value).split(",")]
+            field_name = parts[0]
             key = _camel_to_snake(field_name)
-            if field_cfg:
-                if "bounds" in field_cfg:
-                    lo, hi = field_cfg["bounds"]
-                    bounds[key] = (float(lo), float(hi))
-                if "label" in field_cfg:
-                    label_overrides[key] = field_cfg["label"]
+            label_overrides[key] = label
+            group_names.append(field_name)
+            rest = parts[1:]
+            if rest and not _is_number(rest[0]):
+                log_key_overrides[key] = rest[0]
+                rest = rest[1:]
+            if len(rest) == 2:
+                bounds[key] = (float(rest[0]), float(rest[1]))
         field_groups.append(group_names)
 
     # Parse indicators: list of {label: {field: condition}} dicts
@@ -83,8 +94,9 @@ def _load_config(path: str = "config.yaml") -> dict:
         "server_port":     int(server.get("port", 6789)),
         "field_groups":    field_groups,
         "bounds":          bounds,
-        "label_overrides": label_overrides,
-        "indicators":      indicators,
+        "label_overrides":   label_overrides,
+        "log_key_overrides": log_key_overrides,
+        "indicators":        indicators,
     }
 
 
@@ -118,6 +130,9 @@ CHART_GROUPS: list[list[str]] = [
 ]
 
 BOUNDS: dict[str, tuple[float, float]] = _cfg["bounds"]
+
+# Maps current snake_case key → old log file key (for reading historical .jsonl files)
+LOG_KEY_OVERRIDES: dict[str, str] = _cfg["log_key_overrides"]
 
 # Indicators: list of {label, conditions} — conditions: {field_name: value_or_"on"}
 INDICATORS: list[dict] = _cfg["indicators"]
@@ -329,7 +344,13 @@ def _flush_minute_bucket(minute_str: str):
     record: dict = {"ts": ts}
     for key, values in _minute_bucket.items():
         if values:
-            record[key] = round(sum(values) / len(values), 3)
+            log_key = LOG_KEY_OVERRIDES.get(key, key)
+            record[log_key] = round(sum(values) / len(values), 3)
+
+    # Push into live series before clearing the bucket
+    for key, values in _minute_bucket.items():
+        if values:
+            series[key].append({"ts": ts, "value": record[LOG_KEY_OVERRIDES.get(key, key)]})
     _minute_bucket.clear()
 
     # Persist
@@ -337,11 +358,6 @@ def _flush_minute_bucket(minute_str: str):
         _append_record(record)
     except Exception as e:
         print(f"[persist] write error: {e}")
-
-    # Also push into live series so restored data appears in charts
-    for key in list(EBUSCTL_FIELDS.keys()):
-        if key in record:
-            series[key].append({"ts": ts, "value": record[key]})
 
 
 def restore_today():
@@ -357,8 +373,9 @@ def restore_today():
         for record in records:
             ts = record.get("ts", "")
             for key in list(EBUSCTL_FIELDS.keys()):
-                if key in record:
-                    series[key].append({"ts": ts, "value": record[key]})
+                value = record.get(LOG_KEY_OVERRIDES.get(key, key))
+                if value is not None:
+                    series[key].append({"ts": ts, "value": value})
 
 
 def derive_indicators(latest_snap: dict) -> list[str]:
@@ -536,10 +553,10 @@ def _broadcast(payload: str):
 # ── Flask routes ──────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML,
-                                  fields=json.dumps(EBUSCTL_FIELDS),
-                                  chart_groups=json.dumps(CHART_GROUPS),
-                                  indicators=INDICATORS)
+    return render_template("interface.html",
+                           fields=json.dumps(EBUSCTL_FIELDS),
+                           chart_groups=json.dumps(CHART_GROUPS),
+                           indicators=INDICATORS)
 
 
 @app.route("/roomtemp", methods=["POST"])
@@ -606,8 +623,9 @@ def api_history():
         for record in records:
             ts = record.get("ts", "")
             for key in all_keys:
-                if key in record:
-                    out[key].append({"ts": ts, "value": record[key]})
+                value = record.get(LOG_KEY_OVERRIDES.get(key, key))
+                if value is not None:
+                    out[key].append({"ts": ts, "value": value})
         out["latest"] = {}
         out["logs"]   = []
         out["indicators"] = []
@@ -629,9 +647,10 @@ def api_stream():
     sse_clients.append(q)
 
     def generate():
-        # Send initial snapshot
+        # Send snapshot of most recent live values for KPI tiles
         with data_lock:
-            snap = {k: list(v)[-1] if v else None for k, v in series.items()}
+            snap = {k: {"ts": v["ts"], "value": v["value"]}
+                    for k, v in latest.items() if "value" in v}
         yield f"data: {json.dumps({'type':'snapshot','data':snap})}\n\n"
         try:
             while True:
@@ -651,611 +670,7 @@ def api_stream():
                              "X-Accel-Buffering": "no"})
 
 
-# ── HTML dashboard (embedded) ────────────────────────────────────────────────
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>eBUS Heat Pump Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg:       #080c12;
-    --panel:    #0d1520;
-    --border:   #1a2d45;
-    --accent:   #00d4ff;
-    --accent2:  #ff6b35;
-    --accent3:  #39ff14;
-    --muted:    #4a6070;
-    --text:     #c8dde8;
-    --mono:     'Share Tech Mono', monospace;
-    --sans:     'Exo 2', sans-serif;
-  }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    min-height: 100vh;
-    overflow-x: hidden;
-  }
 
-  /* Scanline overlay */
-  body::after {
-    content:'';
-    position:fixed; inset:0; pointer-events:none;
-    background: repeating-linear-gradient(
-      0deg, transparent, transparent 2px,
-      rgba(0,0,0,.08) 2px, rgba(0,0,0,.08) 4px
-    );
-    z-index:999;
-  }
-
-  header {
-    display: flex; align-items: center; gap: 1.5rem;
-    padding: 1.2rem 2rem;
-    border-bottom: 1px solid var(--border);
-    background: linear-gradient(90deg, #0d1520 0%, #091018 100%);
-  }
-  .logo { font-size: 1.6rem; font-weight: 800; letter-spacing:.06em;
-          color: var(--accent); text-transform: uppercase; }
-  .logo span { color: var(--accent2); }
-  .subtitle { font-size: .8rem; color: var(--muted); font-family: var(--mono); }
-  .status-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: var(--accent3);
-    box-shadow: 0 0 8px var(--accent3);
-    animation: pulse 2s ease-in-out infinite;
-  }
-  .status-dot.offline { background: #ff3b3b; box-shadow: 0 0 8px #ff3b3b; animation: none; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
-
-  .header-right {
-    display: flex; align-items: center; gap: .8rem; margin-left: auto;
-  }
-  .date-select {
-    background: #0a1520; color: var(--muted);
-    border: 1px solid var(--border); border-radius: 2px;
-    font-family: var(--mono); font-size: .7rem;
-    padding: .3rem .5rem; cursor: pointer;
-    outline: none;
-  }
-  .date-select:focus { border-color: var(--accent); color: var(--text); }
-  .btn-live {
-    background: var(--accent2); color: #000;
-    border: none; border-radius: 2px;
-    font-family: var(--mono); font-size: .7rem; font-weight: 700;
-    padding: .3rem .7rem; cursor: pointer;
-    letter-spacing: .05em;
-  }
-  .btn-live:hover { opacity: .85; }
-
-  /* Mode indicators */
-  .mode-badges { display: flex; gap: .6rem; margin-left: auto; align-items: center; }
-  .badge {
-    display: flex; align-items: center; gap: .45rem;
-    padding: .35rem .75rem;
-    border-radius: 2px;
-    border: 1px solid var(--border);
-    font-family: var(--mono); font-size: .7rem; letter-spacing: .08em;
-    text-transform: uppercase;
-    background: #0a1520;
-    color: var(--muted);
-    transition: border-color .4s, color .4s, box-shadow .4s;
-  }
-  .badge-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--muted);
-    transition: background .4s, box-shadow .4s;
-  }
-  .badge.active-0 { border-color: #ff6b35; color: #ff9a6c; box-shadow: 0 0 10px #ff6b3540; }
-  .badge.active-0 .badge-dot { background: #ff6b35; box-shadow: 0 0 6px #ff6b35; animation: pulse 1.4s ease-in-out infinite; }
-  .badge.active-1 { border-color: #00d4ff; color: #6ee6ff; box-shadow: 0 0 10px #00d4ff40; }
-  .badge.active-1 .badge-dot { background: #00d4ff; box-shadow: 0 0 6px #00d4ff; animation: pulse 1.4s ease-in-out infinite; }
-  .badge.active-2 { border-color: #39ff14; color: #80ff60; box-shadow: 0 0 10px #39ff1440; }
-  .badge.active-2 .badge-dot { background: #39ff14; box-shadow: 0 0 6px #39ff14; animation: pulse 1.4s ease-in-out infinite; }
-
-  /* KPI strip */
-  .kpi-strip {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-    gap: 1px;
-    background: var(--border);
-    border-bottom: 1px solid var(--border);
-  }
-  .kpi {
-    background: var(--panel);
-    padding: 1rem 1.2rem;
-    cursor: default;
-    transition: background .2s;
-  }
-  .kpi:hover { background: #111e2e; }
-  .kpi-label { font-size: .65rem; text-transform: uppercase;
-               letter-spacing: .1em; color: var(--muted); margin-bottom: .3rem; }
-  .kpi-value { font-family: var(--mono); font-size: 1.6rem; color: var(--accent);
-               transition: color .4s; }
-  .kpi-value.flash { color: var(--accent3) !important; }
-  .kpi-unit  { font-size: .7rem; color: var(--muted); margin-left: .2rem; }
-
-  /* Charts grid */
-  .charts-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
-    gap: 1px;
-    background: var(--border);
-    padding: 1px;
-  }
-  .chart-card {
-    background: var(--panel);
-    padding: 1.2rem 1.4rem 1rem;
-    position: relative;
-    overflow: hidden;
-  }
-  .chart-card::before {
-    content:'';
-    position:absolute; top:0; left:0; right:0; height:2px;
-    background: linear-gradient(90deg, var(--accent) 0%, transparent 100%);
-  }
-  .chart-title {
-    font-size: .72rem; text-transform: uppercase; letter-spacing: .12em;
-    color: var(--muted); margin-bottom: .8rem; font-family: var(--mono);
-  }
-  canvas { width: 100% !important; }
-
-  .log-section { display: none; }
-
-  footer {
-    padding: .6rem 2rem;
-    font-family: var(--mono); font-size: .65rem; color: var(--muted);
-    border-top: 1px solid var(--border);
-    display: flex; gap: 2rem;
-  }
-
-  @media (max-width: 600px) {
-    .hide-mobile        { display: none; }
-    .subtitle           { display: none; }
-    #status-label       { display: none; }
-    header              { padding: .8rem 1rem; gap: .8rem; }
-    .logo               { font-size: 1.2rem; }
-    .mode-badges        { gap: .4rem; }
-    .badge              { padding: .25rem .5rem; font-size: .65rem; }
-    .date-select        { font-size: .65rem; padding: .25rem .4rem; max-width: 90px; }
-    .btn-live           { font-size: .65rem; padding: .25rem .5rem; }
-    .kpi-strip          { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
-    .kpi                { padding: .7rem .9rem; }
-    .kpi-value          { font-size: 1.2rem; }
-    .charts-grid        { grid-template-columns: 1fr; }
-    .chart-card         { padding: .8rem .9rem .6rem; }
-    canvas              { height: 80px !important; }
-    footer              { padding: .5rem 1rem; font-size: .6rem; }
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div>
-    <div class="logo">e<span>BUS</span> MON<span class="hide-mobile">ITOR</span></div>
-    <div class="subtitle">Heat Pump Live Dashboard</div>
-  </div>
-  <div class="mode-badges">
-    {% for ind in indicators %}
-    <div class="badge" data-indicator="{{ ind.label }}">
-      <div class="badge-dot"></div>
-      <span>{{ ind.label }}</span>
-    </div>
-    {% endfor %}
-  </div>
-  <div class="header-right">
-    <select class="date-select" id="date-select" onchange="onDateChange(this.value)">
-      <option value="">— history —</option>
-    </select>
-    <button class="btn-live" id="btn-live" style="display:none" onclick="returnToLive()">↩ Live</button>
-    <div class="status-dot offline" id="status-dot"></div>
-  </div>
-</header>
-
-<div class="kpi-strip" id="kpi-strip"></div>
-
-<div class="charts-grid" id="charts-grid"></div>
-
-<div class="log-section">
-  <div class="log-header">▸ eBUS traffic log</div>
-  <div id="log-box"></div>
-</div>
-
-<footer>
-  <span id="last-update">last update: —</span>
-  <span>poll interval: {{ chart_groups | tojson | length }} charts / {{ 5 }}s</span>
-</footer>
-
-<script>
-// ── field config (injected from server) ─────────────────────────────────────
-const FIELDS = {{ fields | safe }};
-
-// Client-side overrides — room_temp provides unit (not available from ebusd)
-const DERIVED_FIELDS = {
-  "room_temp": [null, "Room temp","°C"],
-};
-
-// All fields for UI building
-const ALL_FIELDS = { ...FIELDS, ...DERIVED_FIELDS };
-
-// Chart colour palette
-const PALETTE = [
-  '#00d4ff','#ff6b35','#39ff14','#f7c59f',
-  '#b388ff','#4dd0e1','#ffb300','#e91e63',
-  '#ff3b3b','#a0e0ff','#ffe066','#b0ffb0'
-];
-
-const CHART_GROUPS = {{ chart_groups | safe }};
-
-// ── State ────────────────────────────────────────────────────────────────────
-const chartMap   = {};   // primary_key → Chart.js instance
-const kpiMap     = {};   // key → {el, secEl} for KPI values
-const keyToChart = {};   // any key → primary_key (for pushPoint lookup)
-let   viewingDate = null;
-
-// ── Build KPI strip & chart grid ─────────────────────────────────────────────
-function buildUI() {
-  const strip = document.getElementById('kpi-strip');
-  const grid  = document.getElementById('charts-grid');
-  let ci = 0;
-
-  for (const group of CHART_GROUPS) {
-    const primaryKey   = group[0];
-    const secondaryKey = group[1] || null;
-
-    const [, primaryLabel, primaryUnit] = ALL_FIELDS[primaryKey] || [null, primaryKey, ''];
-    const secondaryInfo = secondaryKey ? ALL_FIELDS[secondaryKey] : null;
-    const [, secLabelFull] = secondaryInfo || [null, ''];
-    const secLabel = secLabelFull ? secLabelFull.split(' ')[0] : '';
-
-    const color1 = PALETTE[ci++ % PALETTE.length];
-    const color2 = secondaryKey ? PALETTE[ci++ % PALETTE.length] : null;
-
-    // ── KPI tile ──────────────────────────────────────────────────────────────
-    const kpi = document.createElement('div');
-    kpi.className = 'kpi';
-    if (secondaryKey) {
-      kpi.innerHTML = `
-        <div class="kpi-label">${primaryLabel} <span style="opacity:.5">/ ${secLabel}</span></div>
-        <div style="display:flex;align-items:baseline;gap:.4rem">
-          <span class="kpi-value" id="kpi-${primaryKey}">—</span>
-          <span style="color:var(--muted);font-size:.8rem;margin-left:.1rem">
-            / <span id="kpi-${secondaryKey}" style="font-family:var(--mono);font-size:1rem;color:var(--accent)">—</span>
-          </span>
-          <span class="kpi-unit">${primaryUnit}</span>
-        </div>`;
-    } else {
-      kpi.innerHTML = `
-        <div class="kpi-label">${primaryLabel}</div>
-        <span class="kpi-value" id="kpi-${primaryKey}">—</span>
-        <span class="kpi-unit">${primaryUnit}</span>`;
-    }
-    strip.appendChild(kpi);
-    kpiMap[primaryKey] = kpi.querySelector(`#kpi-${primaryKey}`);
-    if (secondaryKey) kpiMap[secondaryKey] = kpi.querySelector(`#kpi-${secondaryKey}`);
-
-    // ── Chart card ────────────────────────────────────────────────────────────
-    const card = document.createElement('div');
-    card.className = 'chart-card';
-    const chartTitle = secondaryKey
-      ? `${primaryLabel} <span style="opacity:.5">/ ${secLabel}</span>${primaryUnit ? ' (' + primaryUnit + ')' : ''}`
-      : `${primaryLabel}${primaryUnit ? ' (' + primaryUnit + ')' : ''}`;
-    card.innerHTML = `<div class="chart-title">${chartTitle}</div>
-      <canvas id="chart-${primaryKey}" height="120"></canvas>`;
-    grid.appendChild(card);
-
-    const ctx = card.querySelector(`#chart-${primaryKey}`).getContext('2d');
-    const dayStart = new Date(); dayStart.setHours(0,0,0,0);
-    const dayEnd   = new Date(); dayEnd.setHours(23,59,59,999);
-
-    const datasets = [{
-      data: [],
-      borderColor: color1,
-      backgroundColor: color1 + '18',
-      borderWidth: 1.5,
-      pointRadius: 0,
-      tension: 0.3,
-      fill: true,
-      spanGaps: 10 * 60 * 1000,
-      label: primaryLabel,
-    }];
-
-    if (secondaryKey) {
-      datasets.push({
-        data: [],
-        borderColor: color2,
-        backgroundColor: 'transparent',
-        borderWidth: 1.5,
-        borderDash: [4, 3],
-        pointRadius: 0,
-        tension: 0.3,
-        fill: false,
-        spanGaps: 10 * 60 * 1000,
-        label: secLabel,
-      });
-    }
-
-    chartMap[primaryKey] = new Chart(ctx, {
-      type: 'line',
-      data: { datasets },
-      options: {
-        animation: false,
-        responsive: true,
-        maintainAspectRatio: true,
-        plugins: {
-          legend: {
-            display: !!secondaryKey,
-            labels: {
-              color: '#4a6070',
-              font: { family: "'Share Tech Mono'", size: 9 },
-              boxWidth: 20, boxHeight: 1,
-            }
-          }
-        },
-        scales: {
-          x: {
-            type: 'time',
-            min: dayStart, max: dayEnd,
-            time: { unit: 'hour', displayFormats: { hour: 'HH:mm' }, tooltipFormat: 'HH:mm:ss' },
-            ticks: { color: '#4a6070', font: { family: "'Share Tech Mono'", size: 9 },
-                     maxTicksLimit: window.innerWidth <= 600 ? 4 : 12, maxRotation: 0 },
-            grid: { color: '#0f1e2e' }
-          },
-          y: {
-            ticks: { color: '#4a6070', font: { family: "'Share Tech Mono'", size: 9 } },
-            grid:  { color: '#0f1e2e' }
-          }
-        }
-      }
-    });
-
-    // Register key → chart mappings
-    keyToChart[primaryKey] = primaryKey;
-    if (secondaryKey) keyToChart[secondaryKey] = primaryKey;
-  }
-}
-
-// ── Mode indicators ───────────────────────────────────────────────────────────
-function updateIndicators(active) {
-  document.querySelectorAll('[data-indicator]').forEach((el, idx) => {
-    el.className = 'badge' + (active.includes(el.dataset.indicator) ? ` active-${idx}` : '');
-  });
-}
-
-// ── Retroactively patch an out-of-bounds point in the chart ──────────────────
-function fixPoint(key, ts, value) {
-  const primaryKey = keyToChart[key];
-  const chart = chartMap[primaryKey];
-  if (!chart) return;
-  const dsIdx = primaryKey === key ? 0 : 1;
-  // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
-  // UTC by browsers, but we store local timestamps — space forces local parsing.
-  const t = new Date(ts.replace('T', ' ')).getTime();
-  const data = chart.data.datasets[dsIdx].data;
-  for (let i = data.length - 1; i >= 0; i--) {
-    if (data[i].x.getTime() === t) {
-      data[i] = { x: data[i].x, y: value };
-      chart.update('none');
-      break;
-    }
-  }
-}
-
-// Tracks the latest value per key for derived calculations
-const latestValues = {};
-
-// ── Push a data point into chart + KPI ──────────────────────────────────────
-function pushPoint(key, ts, value) {
-  const primaryKey = keyToChart[key];
-  const chart = chartMap[primaryKey];
-  if (!chart) return;
-  latestValues[key] = value;
-  const dsIdx = primaryKey === key ? 0 : 1;
-  // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
-  // UTC by browsers, but we store local timestamps — space forces local parsing.
-  const t = new Date(ts.replace('T', ' '));
-  chart.data.datasets[dsIdx].data.push({ x: t, y: value });
-  chart.update('none');
-
-  // Update KPI
-  const el = kpiMap[key];
-  if (el) {
-    el.textContent = Number.isInteger(value) ? value : value.toFixed(1);
-    el.classList.remove('flash');
-    void el.offsetWidth;
-    el.classList.add('flash');
-    setTimeout(() => el.classList.remove('flash'), 600);
-  }
-}
-
-// ── Log formatter ────────────────────────────────────────────────────────────
-function appendLog(line) {
-  const box = document.getElementById('log-box');
-  const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\S*\s+(.+?received\s+)(.+)$/);
-  const span = document.createElement('span');
-  span.className = 'ln';
-  if (m) {
-    span.innerHTML =
-      `<span class="ts">${m[1]}</span> ` +
-      `<span class="msg">${m[2]}</span>` +
-      `<span class="val">${m[3]}</span>`;
-  } else {
-    span.textContent = line;
-  }
-  box.appendChild(span);
-  box.scrollTop = box.scrollHeight;
-  // trim old lines
-  while (box.children.length > 200) box.removeChild(box.firstChild);
-}
-
-// ── Date picker ───────────────────────────────────────────────────────────────
-async function populateDatePicker() {
-  try {
-    const r = await fetch('/api/dates');
-    const dates = await r.json();
-    const sel = document.getElementById('date-select');
-    const today = new Date().toISOString().substring(0, 10);
-    for (const d of dates.reverse()) {   // most recent first
-      if (d === today) continue;         // skip today — that's "live"
-      const opt = document.createElement('option');
-      opt.value = d;
-      opt.textContent = d;
-      sel.appendChild(opt);
-    }
-  } catch(e) { console.warn('dates load failed', e); }
-}
-
-function clearCharts(dayStr) {
-  const d    = new Date(dayStr);
-  const start = new Date(d); start.setHours(0,0,0,0);
-  const end   = new Date(d); end.setHours(23,59,59,999);
-  for (const chart of Object.values(chartMap)) {
-    chart.data.datasets.forEach(ds => ds.data = []);
-    chart.options.scales.x.min = start;
-    chart.options.scales.x.max = end;
-    chart.update('none');
-  }
-}
-
-async function onDateChange(dateStr) {
-  if (!dateStr) return;
-  viewingDate = dateStr;
-  document.getElementById('btn-live').style.display = 'inline-block';
-  document.getElementById('status-dot').style.display = 'none';
-  clearCharts(dateStr);
-  await loadHistory(dateStr);
-}
-
-async function returnToLive() {
-  viewingDate = null;
-  document.getElementById('btn-live').style.display = 'none';
-  document.getElementById('status-dot').style.display = 'block';
-  document.getElementById('date-select').value = '';
-  const today = new Date().toISOString().substring(0, 10);
-  clearCharts(today);
-  // Restore today's axis bounds
-  const start = new Date(); start.setHours(0,0,0,0);
-  const end   = new Date(); end.setHours(23,59,59,999);
-  for (const chart of Object.values(chartMap)) {
-    chart.options.scales.x.min = start;
-    chart.options.scales.x.max = end;
-  }
-  await loadHistory();
-}
-
-// ── SSE connection ────────────────────────────────────────────────────────────
-function connect() {
-  const es = new EventSource('/api/stream');
-
-  es.onopen = () => {
-    document.getElementById('status-dot').classList.remove('offline');
-  };
-
-  es.onerror = () => {
-    document.getElementById('status-dot').classList.add('offline');
-  };
-
-  es.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    const now = new Date().toISOString().replace('T',' ').substring(0,19);
-    document.getElementById('last-update').textContent = 'last update: ' + now;
-
-    if (msg.type === 'midnight') {
-      if (!viewingDate) {
-        const newStart = new Date(); newStart.setHours(0,0,0,0);
-        const newEnd   = new Date(); newEnd.setHours(23,59,59,999);
-        for (const chart of Object.values(chartMap)) {
-          chart.data.datasets.forEach(ds => ds.data = []);
-          chart.options.scales.x.min = newStart;
-          chart.options.scales.x.max = newEnd;
-          chart.update('none');
-        }
-      }
-      return;
-    }
-
-    // Always update mode badges regardless of viewing mode
-    if (msg.indicators) updateIndicators(msg.indicators);
-
-    // Only push chart data when viewing live
-    if (viewingDate) return;
-
-    if (msg.type === 'snapshot' || msg.type === 'update') {
-      for (const [key, point] of Object.entries(msg.data || {})) {
-        if (key === '_fixes') continue;
-        if (point) pushPoint(key, point.ts, point.value);
-      }
-      for (const fix of (msg.data?._fixes || [])) {
-        fixPoint(fix.key, fix.ts, fix.value);
-      }
-    }
-    if (msg.type === 'log') {
-      appendLog(msg.line);
-    }
-  };
-}
-
-// ── Load history on start ─────────────────────────────────────────────────────
-async function loadHistory(dateStr) {
-  try {
-    const url = dateStr ? `/api/history?date=${dateStr}` : '/api/history';
-    const r = await fetch(url);
-    const h = await r.json();
-
-    for (const [key, points] of Object.entries(h)) {
-      if (key === 'latest' || key === 'logs' || key === 'indicators' || !Array.isArray(points)) continue;
-      const primaryKey = keyToChart[key];
-      if (!primaryKey) continue;
-      const chart = chartMap[primaryKey];
-      if (!chart) continue;
-      const dsIdx = primaryKey === key ? 0 : 1;
-      const data  = chart.data.datasets[dsIdx].data;
-
-      for (const p of points) {
-        // Replace 'T' with space: ISO strings with 'T' and no timezone are parsed as
-        // UTC by browsers, but we store local timestamps — space forces local parsing.
-        const t = new Date(p.ts.replace('T', ' '));
-        data.push({ x: t, y: p.value });
-      }
-    }
-
-    // Update all charts once after all data is loaded
-    for (const chart of Object.values(chartMap)) {
-      chart.update('none');
-    }
-
-
-
-    (h.logs || []).forEach(appendLog);
-    if (h.indicators) updateIndicators(h.indicators);
-
-    if (h.latest) {
-      for (const [key, meta] of Object.entries(h.latest)) {
-        const el = kpiMap[key];
-        if (el && meta.value != null) {
-          el.textContent = Number.isInteger(meta.value)
-            ? meta.value : meta.value.toFixed(1);
-        }
-      }
-    }
-  } catch(e) { console.warn('history load failed', e); }
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-buildUI();
-populateDatePicker();
-loadHistory().then(() => connect());
-</script>
-</body>
-</html>
-"""
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 def _shutdown_flush():
