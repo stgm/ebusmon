@@ -8,6 +8,7 @@ ebusd:
 # Each entry is one chart/KPI tile.
 # Multiple lines under one dash (-) share the same chart.
 # Format: Display name: FieldName, log_field_name, min_bound, max_bound
+#  - values outside [min_bound, max_bound] are filtered out
 # Log field name and bounds are optional: Display name: FieldName
 charts:
   - Room: RoomTemp, 10, 35
@@ -24,7 +25,7 @@ charts:
     Intake: AirIntakeTemp, -30, 60
 
   - Compressor: RunDataCompressorSpeed, compressor_speed, 0, 200
-  - Power: CurrentConsumedPower, power_consumption, 0, 15
+  - Power: RunDataElectricPowerConsumption, power_consumption, 0, 15
     Yield: CurrentYieldPower, power_yield, 0, 20
   - Energy integral: EnergyIntegral, -300, 50
   - Heat curve: HeatCurve, 0, 5
