@@ -41,7 +41,7 @@ Open `config.yaml` and set the address of your ebusd:
 ```yaml
 ebusd:
   host: 127.0.0.1   # ← your ebusd IP address
-  port: 8888            # default ebusd TCP port, usually unchanged
+  port: 8888        # default ebusd TCP port, usually unchanged
 ```
 
 That's the minimum you need to change to get started. The rest of the config
@@ -58,12 +58,11 @@ Then the server starts running.
 Now open your browser at **http://localhost:6789** (or replace `localhost` with the
 machine's IP if you're running it on a different server).
 
-You can point to a different config file with `--config`:
+If you want to keep the example config, you can provide the path to a different
+config file at startup, using `--config`:
 
 ```bash
 uv run app.py --config /path/to/my-config.yaml
-# or short form:
-uv run app.py -c /path/to/my-config.yaml
 ```
 
 ---
@@ -201,10 +200,8 @@ mean ebusd doesn't know that field name.
 
 **"Failed to connect" on startup**
 The app can't reach ebusd. Check that the `host` and `port` in `config.yaml`
-are correct and that ebusd is running. You can test with:
-```bash
-nc -zv 192.168.1.100 8888
-```
+are correct and that ebusd is running. The app does not support anything
+other than an ip address or hostname for the `host` config.
 
 **Outlier spikes in charts**
 Tighten the `bounds` for that field in `config.yaml`. The current bounds may
