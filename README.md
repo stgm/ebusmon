@@ -11,7 +11,7 @@ You can configure the charts that you would like to see in `config.yaml`.
 
 ## Prerequisites
 
-- **uv** — a fast Python package manager ([install instructions](https://docs.astral.sh/uv/getting-started/installation/))
+- **uv** — a Python package manager ([install instructions](https://docs.astral.sh/uv/getting-started/installation/))
 - **ebusd or micro-ebusd** already running and reachable on your network,
   with your heat pump's message definitions loaded
 
@@ -26,6 +26,8 @@ You can configure the charts that you would like to see in `config.yaml`.
 ## Getting started
 
 ### 1. Get the code
+
+This project is not available via `pip` (yet). You will need to clone it to run it.
 
 ```bash
 git clone https://github.com/stgm/ebusmon.git
