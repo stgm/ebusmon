@@ -1,5 +1,7 @@
 # eBUS Heat Pump Live Dashboard
 
+![dashboard example](doc/dashboard.png)
+
 A live monitoring dashboard for eBUS heat pumps. It connects to a running
 [ebusd](https://github.com/john30/ebusd) instance, polls your heat pump's sensors
 every few seconds, and streams the data to a browser dashboard in real time.
@@ -71,69 +73,80 @@ All chart configuration lives in `config.yaml`. You do not need to touch `app.py
 ### How charts are defined
 
 Each entry under `charts:` becomes one chart panel and one KPI tile in the header.
-You specify field names exactly as ebusd knows them (CamelCase message names).
-The dashboard derives the display label and internal key automatically.
+The format is:
 
 ```yaml
 charts:
-  - FlowTemp:
-      bounds: [-5, 90]
+  - Display name: FieldName, min_bound, max_bound
 ```
 
-This creates a chart for the `FlowTemp` message, auto-labelled **"Flow temp"**,
+Example:
+
+```yaml
+  - Flow temp: FlowTemp, -5, 90
+```
+
+This creates a chart labelled **"Flow temp"** for the `FlowTemp` ebusd field,
 with outlier correction applied for values outside −5 … 90.
+
+### Bounds and outlier correction
+
+`min_bound, max_bound` define the physically realistic range for that field.
+Any reading outside this range is assumed to be a glitch and is silently
+replaced by interpolation between the surrounding good values
+(up to two consecutive bad readings are corrected).
+
+Omit the bounds if you don't need outlier correction:
+
+```yaml
+  - Heat curve: HeatCurve
+```
 
 ### Pairing two fields on one chart
 
-Put two field names in the same entry — the first is the primary (left axis),
-the second is the secondary (shown dimmer, used for comparison):
+Put two entries under the same dash (`-`) — the first is the primary (left axis),
+the second is secondary (shown dimmer, used for comparison):
 
 ```yaml
-  - HwcTemp:
-      bounds: [5, 80]
-    TargetTempHwc:
-      bounds: [10, 80]
+  - Water: HwcTemp, 5, 80
+    Target: TargetTempHwc, 10, 80
 ```
 
 This shows DHW temperature and its target setpoint on the same chart.
 
-### Overriding the auto-derived label
+![example chart with two variables](doc/one-graph-with-two-vars.png)
 
-By default, `FlowTemp` becomes "Flow temp", `RunDataReturnTemp` becomes
-"Run data return temp", and so on. If you want something shorter or clearer:
+### Optional log field name
+
+You can provide a custom snake_case key for internal logging, placed between
+`FieldName` and the bounds:
 
 ```yaml
-  - RunDataReturnTemp:
-      label: Return temp
-      bounds: [-5, 80]
+  - Return temp: RunDataReturnTemp, return_temp, -5, 80
 ```
 
-### Bounds and outlier correction
+If omitted, the key is derived automatically from the display name.
 
-`bounds: [lo, hi]` tells the dashboard the physically realistic range for
-that field. Any reading outside this range is assumed to be a glitch and is
-silently replaced by interpolation between the surrounding good values
-(up to two consecutive bad readings are corrected).
+### Non-ebus RoomTemp
 
-Omit `bounds` entirely if you don't want outlier correction for a field.
-
-### Non-ebus fields
-
-You can include fields that don't come from ebusd — for example a manually
-submitted room temperature. These are listed the same way in `config.yaml`;
-the dashboard simply won't poll ebusd for them. Use the `RoomTemp` convention
-(CamelCase), which the app converts to the `room_temp` internal key.
-
-Room temperature can be submitted via HTTP POST:
+There is one special case variable. If you do not have a room thermostat
+in your system, the room temperature will not be available on the eBus.
+Hence, the app will accept room temperatures at a special URL.
 
 ```bash
 curl -X POST http://localhost:6789/roomtemp \
      -d "current=20.5"
 ```
 
+For example, it's possible to have Apple Homekit send a room temperature
+to the dashboard every so many minutes.
+
 ### Field names
 
-The field names you use in `config.yaml` must match what ebusd calls them.
+The `FieldName` part must match what ebusd calls the message. This is 
+part of the ebusd configuration. The example config uses common variable
+names, but if any data is missing, your might want to check whether
+the ebusd config calls it differently.
 
 ---
 
@@ -159,10 +172,9 @@ Two condition types:
 ## How it works
 
 1. On startup, we load all message definitions from ebusd and resolve
-   your configured field names. Fields not found in ebusd are skipped with a
-   warning in the console.
-2. A background loop polls all configured fields every 15 seconds, using
-   ebusd's value cache to avoid hammering the bus.
+   your configured field names.
+      - Fields not found in ebusd are skipped with a warning in the console.
+2. A background loop polls all configured fields every 15 seconds.
 3. Readings are averaged per minute and written to `data/YYYY-MM-DD.jsonl`
    for persistence. Today's file is restored into memory on startup so the
    full day is visible immediately.
@@ -195,8 +207,3 @@ nc -zv 192.168.1.100 8888
 **Outlier spikes in charts**
 Tighten the `bounds` for that field in `config.yaml`. The current bounds may
 be too wide to catch the glitches your heat pump produces.
-
-**Values look stale**
-ebusd caches values on the bus. The dashboard accepts cached values up to
-`2 × poll interval` (30 seconds by default). This is normal — it reduces
-bus traffic.
