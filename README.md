@@ -1,11 +1,9 @@
 # eBUS Heat Pump Live Dashboard
 
 A live monitoring dashboard for eBUS heat pumps. It connects to a running
-[ebusd](https://github.com/john30/ebusd) instance via
-[pyebus](https://github.com/c0fec0de/pyebus), polls your heat pump's sensors
+[ebusd](https://github.com/john30/ebusd) instance, polls your heat pump's sensors
 every few seconds, and streams the data to a browser dashboard in real time.
-
-Charts are fully configurable via a single YAML file — no Python knowledge needed.
+You can configure the charts that you would like to see in `config.yaml`.
 
 ---
 
@@ -28,8 +26,8 @@ Charts are fully configurable via a single YAML file — no Python knowledge nee
 ### 1. Get the code
 
 ```bash
-git clone https://github.com/youruser/ebusgraphs.git
-cd ebusgraphs
+git clone https://github.com/stgm/ebusmon.git
+cd ebusmon
 ```
 
 ### 2. Edit the config file
@@ -38,15 +36,12 @@ Open `config.yaml` and set the address of your ebusd:
 
 ```yaml
 ebusd:
-  host: 192.168.1.100   # ← your ebusd IP address
+  host: 127.0.0.1   # ← your ebusd IP address
   port: 8888            # default ebusd TCP port, usually unchanged
-
-server:
-  port: 6789            # the port this dashboard listens on
 ```
 
 That's the minimum you need to change to get started. The rest of the config
-controls which fields are displayed — see [Configuring charts](#configuring-charts) below.
+controls which fields are displayed, and some nice defaults are included.
 
 ### 3. Run the dashboard
 
@@ -54,9 +49,10 @@ controls which fields are displayed — see [Configuring charts](#configuring-ch
 uv run app.py
 ```
 
-`uv` can install dependencies. Then open
-your browser at **http://localhost:6789** (or replace `localhost` with the
-machine's IP if you're running it on a server).
+`uv` will make sure that dependencies are installed into the `.venv` directory.
+Then the server starts running.
+Now open your browser at **http://localhost:6789** (or replace `localhost` with the
+machine's IP if you're running it on a different server).
 
 You can point to a different config file with `--config`:
 

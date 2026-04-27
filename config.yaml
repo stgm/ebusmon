@@ -1,8 +1,10 @@
+# This application runs on
 server:
   port: 6789
 
+# Ebusd runs at the following address and port
 ebusd:
-  host: 192.168.178.27
+  host: 127.0.0.1
   port: 8888
 
 # Each entry is one chart/KPI tile.

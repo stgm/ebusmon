@@ -1,3 +1,0 @@
-flask>=3.0
-pyebus
-pyyaml
