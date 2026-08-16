@@ -5,6 +5,8 @@ Uses pyebus to communicate directly with ebusd over TCP.
 import argparse
 import atexit
 import json
+import signal
+import sys
 import threading
 from datetime import date, datetime
 
@@ -125,6 +127,22 @@ def api_stream():
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
+def _install_shutdown_handlers():
+    """
+    Make sure remaining data is summarized and logged when the server is
+    killed.
+
+    Install this when the main thread no longer holds state.data_lock
+    the handler runs on the main thread and would deadlock on its own lock.
+    """
+    def handle(_signum, _frame):
+        aggregate.shutdown_flush()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ebusd Live Dashboard")
     parser.add_argument("--config", "-c", default="config.yaml", metavar="FILE",
@@ -136,6 +154,7 @@ def main():
     atexit.register(aggregate.shutdown_flush)
 
     persistence.restore_today()
+    _install_shutdown_handlers()
     threading.Thread(target=polling.start_async_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=state.cfg.server_port, debug=False, threaded=True)
 
