@@ -7,8 +7,8 @@
   --accent3:  #39ff14;
   --muted:    #4a6070;
   --text:     #c8dde8;
-  --mono:     'Share Tech Mono', monospace;
-  --sans:     'Exo 2', sans-serif;
+  --mono:     monospace;
+  --sans:     sans-serif;
 }
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -109,9 +109,9 @@ header {
   transition: background .2s;
 }
 .kpi:hover { background: #111e2e; }
-.kpi-label { font-size: .65rem; text-transform: uppercase;
+.kpi-label { font-size: .55rem; text-transform: uppercase;
              letter-spacing: .1em; color: var(--muted); margin-bottom: .3rem; }
-.kpi-value { font-family: var(--mono); font-size: 1.6rem; color: var(--accent);
+.kpi-value { font-family: var(--mono); font-size: 1.3rem; color: var(--accent);
              transition: color .4s; }
 .kpi-value.flash { color: var(--accent3) !important; }
 .kpi-unit  { font-size: .7rem; color: var(--muted); margin-left: .2rem; }
