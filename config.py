@@ -1,22 +1,25 @@
-import argparse
+"""
+config.yaml → Config.
+
+Importing this module has no side effects: `load()` is called once, from
+app.main(). Nothing here changes at runtime — values that do, such as the units
+reported by ebusd and the readings themselves, live in `state`.
+"""
 import re
-import yaml
+from dataclasses import dataclass
 from pathlib import Path
 
-POLL_INTERVAL  = 15
-HISTORY_POINTS = 1440
-DATA_DIR       = Path("data")
-READ_TTL       = POLL_INTERVAL * 2
+import yaml
 
 
-def _camel_to_snake(name: str) -> str:
+def camel_to_snake(name: str) -> str:
     s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
     s = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s)
     return s.lower()
 
 
-def _camel_to_label(name: str) -> str:
-    if name == name.lower():
+def camel_to_label(name: str) -> str:
+    if name == name.lower():          # already snake_case (e.g. room_temp)
         words = name.split('_')
         return ' '.join([words[0].capitalize()] + words[1:]) if words else name
     s = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', name)
@@ -25,34 +28,61 @@ def _camel_to_label(name: str) -> str:
     return ' '.join([words[0].capitalize()] + [w.lower() for w in words[1:]]) if words else name
 
 
-def _load_config(path: str = "config.yaml") -> dict:
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
+@dataclass(frozen=True)
+class Config:
+    ebusd_host:  str
+    ebusd_port:  int
+    server_port: int
 
-    ebusd = cfg.get("ebusd", {})
-    host  = ebusd.get("host", "127.0.0.1")
-    port  = int(ebusd.get("port", 8888))
+    # key → (ebus field name, display label)
+    fields:            dict[str, tuple[str, str]]
+    # charts, as lists of keys; the first of each list is the primary series
+    chart_groups:      list[list[str]]
+    bounds:            dict[str, tuple[float, float]]
+    # key → the name this field is written under in the .jsonl files
+    log_key_overrides: dict[str, str]
+    # {"label": str, "conditions": {key: condition}} — keys already resolved
+    indicators:        list[dict]
+    # key → ebus field name, for indicator fields that are not charted
+    extra_fields:      dict[str, str]
 
-    field_groups: list[list[str]]             = []
-    bounds:       dict[str, tuple[float, float]] = {}
-    label_overrides:   dict[str, str]         = {}
-    log_key_overrides: dict[str, str]         = {}
+    data_dir:       Path = Path("data")
+    poll_interval:  int  = 15
+    history_points: int  = 1440       # one per minute × 24 h
 
-    def _is_number(s: str) -> bool:
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
+    @property
+    def read_ttl(self) -> int:
+        """TTL passed to async_read: accept a cached value up to this old."""
+        return self.poll_interval * 2
 
-    for chart_entry in cfg.get("charts", []):
+
+def _is_number(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_charts(entries) -> tuple[list, dict, dict, dict]:
+    """
+    Each entry is one chart; entries sharing a dash share a chart.
+    Format: "Display name: FieldName[, log_key][, min, max]".
+    """
+    field_groups:      list[list[str]]               = []
+    bounds:            dict[str, tuple[float, float]] = {}
+    labels:            dict[str, str]                = {}
+    log_key_overrides: dict[str, str]                = {}
+
+    for chart_entry in entries:
         group_names = []
         for label, value in chart_entry.items():
-            parts = [p.strip() for p in str(value).split(",")]
+            parts      = [p.strip() for p in str(value).split(",")]
             field_name = parts[0]
-            key = _camel_to_snake(field_name)
-            label_overrides[key] = label
+            key        = camel_to_snake(field_name)
+            labels[key] = label
             group_names.append(field_name)
+
             rest = parts[1:]
             if rest and not _is_number(rest[0]):
                 log_key_overrides[key] = rest[0]
@@ -61,60 +91,50 @@ def _load_config(path: str = "config.yaml") -> dict:
                 bounds[key] = (float(rest[0]), float(rest[1]))
         field_groups.append(group_names)
 
-    indicators: list[dict] = []
-    for entry in cfg.get("indicators", []):
-        for label, conditions in entry.items():
-            indicators.append({"label": label, "conditions": dict(conditions)})
+    return field_groups, bounds, labels, log_key_overrides
 
+
+def load(path: str = "config.yaml") -> Config:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+
+    ebusd  = cfg.get("ebusd", {})
     server = cfg.get("server", {})
 
-    return {
-        "host":              host,
-        "port":              port,
-        "server_port":       int(server.get("port", 6789)),
-        "field_groups":      field_groups,
-        "bounds":            bounds,
-        "label_overrides":   label_overrides,
-        "log_key_overrides": log_key_overrides,
-        "indicators":        indicators,
-    }
+    field_groups, bounds, labels, log_key_overrides = _parse_charts(cfg.get("charts", []))
 
+    # Flatten the groups into a deduplicated key → (name, label) mapping.
+    fields: dict[str, tuple[str, str]] = {}
+    for group in field_groups:
+        for name in group:
+            key = camel_to_snake(name)
+            if key not in fields:
+                fields[key] = (name, labels.get(key) or camel_to_label(name))
 
-_parser = argparse.ArgumentParser(description="ebusd Live Dashboard")
-_parser.add_argument("--config", "-c", default="config.yaml", metavar="FILE",
-                     help="path to config file (default: config.yaml)")
-_args, _ = _parser.parse_known_args()
+    chart_groups = [[camel_to_snake(n) for n in group] for group in field_groups]
 
-_cfg = _load_config(_args.config)
+    # Conditions are resolved to keys here so the poll loop does not redo it on
+    # every cycle. extra_fields keeps the ebus name, which is what ebusd is asked for.
+    indicators:   list[dict]     = []
+    extra_fields: dict[str, str] = {}
+    for entry in cfg.get("indicators", []):
+        for label, conditions in entry.items():
+            resolved = {}
+            for name, condition in conditions.items():
+                key = camel_to_snake(name)
+                resolved[key] = condition
+                if key not in fields and key not in extra_fields:
+                    extra_fields[key] = name
+            indicators.append({"label": label, "conditions": resolved})
 
-EBUSD_HOST  = _cfg["host"]
-EBUSD_PORT  = _cfg["port"]
-SERVER_PORT = _cfg["server_port"]
-
-EBUSCTL_FIELDS: dict[str, tuple] = {}
-_seen: set[str] = set()
-for _group in _cfg["field_groups"]:
-    for _name in _group:
-        _key = _camel_to_snake(_name)
-        if _key not in _seen:
-            _seen.add(_key)
-            _label = _cfg["label_overrides"].get(_key) or _camel_to_label(_name)
-            EBUSCTL_FIELDS[_key] = (_name, _label, "")
-del _seen, _group, _name, _key, _label
-
-CHART_GROUPS: list[list[str]] = [
-    [_camel_to_snake(n) for n in group]
-    for group in _cfg["field_groups"]
-]
-
-BOUNDS:            dict[str, tuple[float, float]] = _cfg["bounds"]
-LOG_KEY_OVERRIDES: dict[str, str]                 = _cfg["log_key_overrides"]
-INDICATORS:        list[dict]                      = _cfg["indicators"]
-
-EXTRA_FIELDS: dict[str, str] = {}
-for _ind in INDICATORS:
-    for _fname in _ind["conditions"]:
-        _key = _camel_to_snake(_fname)
-        if _key not in EBUSCTL_FIELDS and _key not in EXTRA_FIELDS:
-            EXTRA_FIELDS[_key] = _fname
-del _ind, _fname, _key
+    return Config(
+        ebusd_host        = ebusd.get("host", "127.0.0.1"),
+        ebusd_port        = int(ebusd.get("port", 8888)),
+        server_port       = int(server.get("port", 6789)),
+        fields            = fields,
+        chart_groups      = chart_groups,
+        bounds            = bounds,
+        log_key_overrides = log_key_overrides,
+        indicators        = indicators,
+        extra_fields      = extra_fields,
+    )

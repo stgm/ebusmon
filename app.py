@@ -2,20 +2,22 @@
 ebusd Live Dashboard - Flask Backend
 Uses pyebus to communicate directly with ebusd over TCP.
 """
+import argparse
 import atexit
 import json
-import queue
-import re
 import threading
 from datetime import date, datetime
 
 from flask import Flask, Response, jsonify, render_template, request
 
+import aggregate
 import config
+import ebus_client
+import indicators
 import persistence
 import polling
+import sse
 import state
-from ebus_client import parse_value
 
 app = Flask(__name__)
 
@@ -25,21 +27,28 @@ app = Flask(__name__)
 @app.route("/")
 def index():
     return render_template("interface.html",
-                           fields=json.dumps(config.EBUSCTL_FIELDS),
-                           chart_groups=json.dumps(config.CHART_GROUPS),
-                           indicators=config.INDICATORS)
+                           fields=json.dumps(state.fields),
+                           chart_groups=json.dumps(state.cfg.chart_groups),
+                           indicators=state.cfg.indicators)
 
 
 @app.route("/roomtemp", methods=["POST"])
 def post_roomtemp():
+    """
+    Accept a room temperature from outside ebusd.
+
+    Systems without a room thermostat have no RoomTemp on the bus, so this
+    stands in for one: the reading joins the same pipeline as a polled field.
+    """
     raw = request.form.get("current") or request.json and request.json.get("current")
     if raw is None:
         return jsonify({"error": "missing 'current' param"}), 400
-    value = parse_value(str(raw).replace(',', '.'))
+    # Normalise comma decimal separator (e.g. "20,5" → "20.5")
+    value = ebus_client.parse_value(str(raw).replace(',', '.'))
     if value is None:
         return jsonify({"error": "invalid value"}), 400
 
-    lo, hi = config.BOUNDS.get("room_temp", (-99, 99))
+    lo, hi = state.cfg.bounds.get("room_temp", (-99, 99))
     if not (lo <= value <= hi):
         return jsonify({"error": f"value {value} out of bounds [{lo}, {hi}]"}), 400
 
@@ -48,70 +57,53 @@ def post_roomtemp():
     with state.data_lock:
         state.latest["room_temp"] = {"value": value, "unit": "°C",
                                      "label": "Room Temp", "raw": str(raw), "ts": ts}
-        state._minute_bucket["room_temp"].append(value)
+    aggregate.add_sample("room_temp", ts, value)
 
     print(f"[roomtemp] {ts}: {value} °C")
-    polling.broadcast(json.dumps({"type": "update", "ts": ts,
-                                  "data": {"room_temp": point},
-                                  "indicators": polling.derive_indicators(state.latest)}))
+    sse.broadcast(json.dumps({"type": "update", "ts": ts,
+                              "data": {"room_temp": point},
+                              "indicators": indicators.derive(state.latest,
+                                                              state.cfg.indicators)}))
     return jsonify({"ok": True, "ts": ts, "value": value})
 
 
 @app.route("/api/dates")
 def api_dates():
-    if not config.DATA_DIR.exists():
-        return jsonify([])
-    days = sorted(
-        p.stem for p in config.DATA_DIR.glob("*.jsonl")
-        if re.match(r"\d{4}-\d{2}-\d{2}", p.stem)
-    )
-    return jsonify(days)
+    """Available day strings (YYYY-MM-DD), for the history picker."""
+    return jsonify(persistence.available_days())
 
 
 @app.route("/api/history")
 def api_history():
-    req_date = request.args.get("date")
+    req_date = request.args.get("date")  # optional ?date=YYYY-MM-DD
 
     if req_date and req_date != date.today().isoformat():
-        path = config.DATA_DIR / f"{req_date}.jsonl"
-        records = []
-        if path.exists():
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-        all_keys = list(config.EBUSCTL_FIELDS.keys())
-        out: dict = {k: [] for k in all_keys}
-        for record in records:
-            ts = record.get("ts", "")
-            for key in all_keys:
-                value = record.get(config.LOG_KEY_OVERRIDES.get(key, key))
-                if value is not None:
-                    out[key].append({"ts": ts, "value": value})
+        # Serve a past day from its .jsonl file. Parsing the date rather than
+        # interpolating it into a path also keeps the request inside data_dir.
+        try:
+            day = date.fromisoformat(req_date)
+        except ValueError:
+            return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+
+        out: dict = persistence.day_series(day)
         out["latest"]     = {}
-        out["logs"]       = []
         out["indicators"] = []
         return jsonify(out)
 
+    # Today: serve live in-memory series
     with state.data_lock:
         out = {k: list(v) for k, v in state.series.items()}
         out["latest"]     = dict(state.latest)
-        out["logs"]       = list(state.log_lines)
-        out["indicators"] = polling.derive_indicators(state.latest)
+        out["indicators"] = indicators.derive(state.latest, state.cfg.indicators)
     return jsonify(out)
 
 
 @app.route("/api/stream")
 def api_stream():
-    q = queue.Queue(maxsize=50)
-    state.sse_clients.append(q)
+    q = sse.register()
 
     def generate():
+        # Send snapshot of most recent live values for KPI tiles
         with state.data_lock:
             snap = {k: {"ts": v["ts"], "value": v["value"]}
                     for k, v in state.latest.items() if "value" in v}
@@ -122,12 +114,9 @@ def api_stream():
                     msg = q.get(timeout=25)
                     yield f"data: {msg}\n\n"
                 except Exception:
-                    yield ": ping\n\n"
+                    yield ": ping\n\n"   # keepalive
         finally:
-            try:
-                state.sse_clients.remove(q)
-            except ValueError:
-                pass
+            sse.unregister(q)
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
@@ -136,9 +125,20 @@ def api_stream():
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 
-atexit.register(persistence.shutdown_flush)
+def main():
+    parser = argparse.ArgumentParser(description="ebusd Live Dashboard")
+    parser.add_argument("--config", "-c", default="config.yaml", metavar="FILE",
+                        help="path to config file (default: config.yaml)")
+    args = parser.parse_args()
 
-if __name__ == "__main__":
+    state.init(config.load(args.config))
+    aggregate.init()
+    atexit.register(aggregate.shutdown_flush)
+
     persistence.restore_today()
     threading.Thread(target=polling.start_async_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=config.SERVER_PORT, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=state.cfg.server_port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

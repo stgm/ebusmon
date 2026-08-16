@@ -189,6 +189,18 @@ Historical days are available via the date picker in the top-right corner.
 
 ---
 
+## Running the tests
+
+```bash
+uv run pytest
+```
+
+The tests cover config parsing, outlier correction, indicator conditions, the
+minute averaging, and reading and writing the daily files. They need no ebusd
+connection and write only to a temporary directory.
+
+---
+
 ## Troubleshooting
 
 **No data appears / fields show "—"**

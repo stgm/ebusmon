@@ -191,25 +191,6 @@ function pushPoint(key, ts, value) {
   }
 }
 
-// ── Log formatter ────────────────────────────────────────────────────────────
-function appendLog(line) {
-  const box = document.getElementById('log-box');
-  const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\S*\s+(.+?received\s+)(.+)$/);
-  const span = document.createElement('span');
-  span.className = 'ln';
-  if (m) {
-    span.innerHTML =
-      `<span class="ts">${m[1]}</span> ` +
-      `<span class="msg">${m[2]}</span>` +
-      `<span class="val">${m[3]}</span>`;
-  } else {
-    span.textContent = line;
-  }
-  box.appendChild(span);
-  box.scrollTop = box.scrollHeight;
-  while (box.children.length > 200) box.removeChild(box.firstChild);
-}
-
 // ── Date picker ───────────────────────────────────────────────────────────────
 async function populateDatePicker() {
   try {
@@ -308,9 +289,6 @@ function connect() {
         fixPoint(fix.key, fix.ts, fix.value);
       }
     }
-    if (msg.type === 'log') {
-      appendLog(msg.line);
-    }
   };
 }
 
@@ -322,7 +300,7 @@ async function loadHistory(dateStr) {
     const h = await r.json();
 
     for (const [key, points] of Object.entries(h)) {
-      if (key === 'latest' || key === 'logs' || key === 'indicators' || !Array.isArray(points)) continue;
+      if (key === 'latest' || key === 'indicators' || !Array.isArray(points)) continue;
       const primaryKey = keyToChart[key];
       if (!primaryKey) continue;
       const chart = chartMap[primaryKey];
@@ -336,7 +314,6 @@ async function loadHistory(dateStr) {
 
     for (const chart of Object.values(chartMap)) chart.update('none');
 
-    (h.logs || []).forEach(appendLog);
     if (h.indicators) updateIndicators(h.indicators);
 
     if (h.latest) {

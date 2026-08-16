@@ -1,33 +1,38 @@
+"""
+Everything that knows about pyebus. Read path only — the app never writes to
+the heat pump.
+"""
 import re
 
-import config
-import state
 
-
-def run_async(coro):
-    """Submit a coroutine to the shared event loop and block until done."""
-    import asyncio
-
-    fut = asyncio.run_coroutine_threadsafe(coro, state._loop)
-    return fut.result(timeout=15)
-
-
-async def make_ebus():
+async def make_ebus(host: str, port: int):
+    """Create and connect an Ebus instance with msgdefs loaded."""
     from pyebus import Ebus
 
-    ebus = Ebus(config.EBUSD_HOST, port=config.EBUSD_PORT)
+    ebus = Ebus(host, port=port)
     await ebus.async_load_msgdefs()
     return ebus
 
 
 def build_field_map(ebus) -> dict[str, object]:
+    """
+    Map lowercase name → (msgdef, fielddef), indexed three ways in priority order:
+
+    1. msgdef.name — the message name, which is what ebusctl uses.
+    2. fielddef.name — more specific, so it overrides a message-level entry.
+    3. the last component of a "Message/field" name, e.g. "value" for
+       "RunDataCompressorSpeed/value" — only if nothing already claims it, since
+       short names collide easily.
+    """
     field_map = {}
+
     for msgdef in ebus.msgdefs:
         mname = msgdef.name.lower()
         if mname not in field_map:
             fields = list(msgdef.fields)
             if fields:
                 field_map[mname] = (msgdef, fields[0])
+
     for msgdef in ebus.msgdefs:
         for fielddef in msgdef.fields:
             fname = fielddef.name.lower()
@@ -36,13 +41,17 @@ def build_field_map(ebus) -> dict[str, object]:
                 short = fname.split("/")[-1]
                 if short not in field_map:
                     field_map[short] = (msgdef, fielddef)
+
     return field_map
 
 
 def parse_value(raw) -> float | None:
     """
-    Convert a pyebus field value to float.
-    Returns None for pure strings (e.g. ThreeWayValve) so the caller stores raw.
+    Convert a value to float, or None if it holds no number.
+
+    pyebus returns typed values; strings that contain a number (including
+    scientific notation) are parsed, and pure strings such as a ThreeWayValve
+    position return None so the caller stores the raw text instead.
     """
     if isinstance(raw, (int, float)):
         return round(float(raw), 4)

@@ -141,8 +141,6 @@ header {
 }
 canvas { width: 100% !important; }
 
-.log-section { display: none; }
-
 footer {
   padding: .6rem 2rem;
   font-family: var(--mono); font-size: .65rem; color: var(--muted);

@@ -1,39 +1,47 @@
-import config
-import state
+"""
+Bounds-based outlier correction.
+
+A reading outside [lo, hi] is treated as a glitch and replaced by linear
+interpolation between its surrounding good neighbours.
+
+Two limits apply. A run of out-of-bounds points is only corrected if it is at
+most 2 long — a longer run is more likely a real state change than a glitch, so
+it is left alone. And a run needs a good point on both sides to interpolate
+between, so a bad point at either end of the window is skipped and reconsidered
+on a later call, once more readings have arrived.
+
+WINDOW is how many recent raw readings the caller keeps per field. It sets how
+long a bad point stays correctable: it must still be in the window when a good
+reading arrives after it.
+"""
+
+WINDOW = 5
 
 
-def _in_bounds(key: str, value: float) -> bool:
-    lo, hi = config.BOUNDS[key]
-    return lo <= value <= hi
-
-
-def check_and_correct(key: str) -> list[dict]:
+def correct_window(points: list[dict], lo: float, hi: float) -> list[dict]:
     """
-    Called after a new raw point has been appended to state._windows[key].
+    Scan `points` oldest → newest and interpolate over short out-of-bounds runs.
 
-    Scans the window from oldest to newest. Any run of 1 or 2 consecutive
-    out-of-bounds points flanked by in-bounds points on both sides is replaced
-    by linear interpolation between those flanking points.
+    `points` is a list of {"ts": str, "value": float}. It is not modified — the
+    function is pure, and the caller applies the result to its own window.
 
-    Returns a list of {ts, value} correction dicts to broadcast (may be empty).
+    Returns a list of {"ts", "value", "was"} dicts, one per corrected point:
+    the timestamp it applies to, the interpolated value, and the reading it
+    replaces (for logging).
     """
-    if key not in config.BOUNDS:
-        return []
-
-    win = list(state._windows[key])
-    n   = len(win)
-    corrections = []
+    win = list(points)
+    n = len(win)
+    corrections: list[dict] = []
     i = 0
 
     while i < n:
-        if _in_bounds(key, win[i]["value"]):
+        if lo <= win[i]["value"] <= hi:
             i += 1
             continue
 
         run_end = i + 1
-        while run_end < n and not _in_bounds(key, win[run_end]["value"]):
+        while run_end < n and not (lo <= win[run_end]["value"] <= hi):
             run_end += 1
-
         run_len = run_end - i
 
         if run_len <= 2 and i > 0 and run_end < n:
@@ -42,19 +50,11 @@ def check_and_correct(key: str) -> list[dict]:
             steps     = run_len + 1
 
             for offset in range(run_len):
-                pt     = win[i + offset]
+                point  = win[i + offset]
                 interp = round(left_val + (right_val - left_val) * (offset + 1) / steps, 3)
-                print(f"[bounds] {key}: {pt['value']} out of {config.BOUNDS[key]}, "
-                      f"corrected → {interp}")
-                win[i + offset] = {**pt, "value": interp}
-                corrections.append({"ts": pt["ts"], "value": interp})
-
-            real_win = state._windows[key]
-            for offset in range(run_len):
-                idx_from_end = n - (i + offset) - 1
-                real_win.rotate(idx_from_end + 1)
-                real_win[0] = win[i + offset]
-                real_win.rotate(-(idx_from_end + 1))
+                win[i + offset] = {**point, "value": interp}
+                corrections.append({"ts": point["ts"], "value": interp,
+                                    "was": point["value"]})
 
         i = run_end
 
